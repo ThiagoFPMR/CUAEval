@@ -36,6 +36,8 @@ def build_command(plan: Plan, job: JobConfig) -> list[str]:
         "--num_envs", str(job.num_envs),
         "--provider_name", job.provider_name,
     ]
+    if job.provider_name == "aws":
+        cmd += ["--region", job.region]
     if job.domain and job.domain != "all":
         cmd += ["--domain", job.domain]
     cmd += job.runner_args

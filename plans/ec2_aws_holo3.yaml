@@ -1,0 +1,60 @@
+# EC2 + AWS-provider + vast.ai-served plan.
+#
+# The intended flow, from a fresh Ubuntu EC2 host:
+#
+#   git clone <this repo> && cd CUAEval
+#   ./setup_ec2.sh plans/ec2_aws_holo3.yaml       # installs deps, bootstraps OSWorld
+#   export AWS_ACCESS_KEY_ID=...  AWS_SECRET_ACCESS_KEY=...
+#   export AWS_SECURITY_GROUP_ID=sg-...  AWS_SUBNET_ID=subnet-...
+#   export VAST_API_KEY=...                         # or: vastai set api-key <key>
+#   uv run cuaeval run plans/ec2_aws_holo3.yaml
+#
+# OSWorld runs its task VMs via the `aws` provider (host/client: this EC2 box
+# spawns worker EC2 client instances). The MODEL is served on a vast.ai GPU box
+# that CUAEval rents, serves, tunnels to localhost, and destroys per job.
+
+# Where the OSWorld checkout lives (created by `cuaeval bootstrap` / setup_ec2.sh).
+osworld_repo: ./OSWorld
+
+osworld:
+  repo_url: https://github.com/xlang-ai/OSWorld
+  ref: main                 # pin a commit SHA or tag here for reproducible runs
+  adapters: [holo3]         # copied from CUAEval/adapters/holo3 on top of the clone
+
+defaults:
+  runner: holo3                                     # -> run_multienv_holo3.py
+  meta: evaluation_examples/test_nogdrive.json
+  result_dir: ./results
+  max_steps: 15
+  num_envs: 5
+  provider_name: aws                                # OSWorld task VMs on AWS
+  region: us-east-1
+  runner_args:
+    - --headless
+    - --observation_type
+    - screenshot
+    - --sleep_after_execution
+    - "3"
+    - --client_password
+    - osworld-public-evaluation                     # AWS client VM default password
+  serve:
+    location: remote
+    framework: sglang
+    port: 60000
+    tunnel_port: 9091
+    tp: 1
+    context_length: 32768
+    remote_models_dir: /models
+    vast:
+      provision: true          # rent a fresh GPU box for each job...
+      # destroy: (defaults to provision's value) -> box is torn down after the job
+      gpu_name: RTX_4090
+      num_gpus: 1
+      disk: 80
+
+jobs:
+  - label: holo3-gimp-pruned-half
+    weights: s3://omnibrowse-s3/models/holo3-gimp-pruned-half
+
+  - label: holo3-gimp-pruned-quarter
+    weights: s3://omnibrowse-s3/models/holo3-gimp-pruned-quarter

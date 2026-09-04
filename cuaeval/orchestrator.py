@@ -2,12 +2,19 @@
 then tear it down before moving to the next. One model is loaded at a time."""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 from .backends import make_backend
 from .config import JobConfig, Plan
 from .osworld import read_score, run_benchmark, runner_script
 from .util import log
+
+# Env vars OSWorld's `aws` provider needs to launch client VMs (see SETUP_GUIDELINE §3).
+_AWS_REQUIRED_ENV = (
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+    "AWS_SECURITY_GROUP_ID", "AWS_SUBNET_ID",
+)
 
 
 @dataclass
@@ -19,17 +26,34 @@ class JobResult:
     score: float | None = None
 
 
-def _preflight(plan: Plan) -> None:
+def _preflight(plan: Plan, *, dry_run: bool = False) -> None:
     """Fail fast on config that can't possibly work, before spending a run."""
     if not plan.osworld_repo.exists():
-        raise FileNotFoundError(f"osworld_repo does not exist: {plan.osworld_repo}")
+        raise FileNotFoundError(
+            f"osworld_repo does not exist: {plan.osworld_repo}\n"
+            f"  run `cuaeval bootstrap <plan>` first to clone OSWorld + install adapters."
+        )
     for job in plan.jobs:
         runner_script(plan.osworld_repo, job.runner)  # raises if missing
+    if not dry_run:
+        _preflight_aws(plan)
+
+
+def _preflight_aws(plan: Plan) -> None:
+    """If any job uses the aws VM provider, the client-launch env must be set."""
+    if not any(j.provider_name == "aws" for j in plan.jobs):
+        return
+    missing = [v for v in _AWS_REQUIRED_ENV if not os.environ.get(v)]
+    if missing:
+        raise EnvironmentError(
+            "provider_name=aws needs these env vars set (see SETUP_GUIDELINE §3): "
+            + ", ".join(missing)
+        )
 
 
 def run_plan(plan: Plan, *, dry_run: bool = False, only: set[str] | None = None,
              keep_going: bool = False) -> list[JobResult]:
-    _preflight(plan)
+    _preflight(plan, dry_run=dry_run)
     results: list[JobResult] = []
 
     jobs = [j for j in plan.jobs if not only or j.label in only]

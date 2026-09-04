@@ -1,0 +1,31 @@
+# Holo3 adapter set for OSWorld.
+#
+# `cuaeval bootstrap` clones a pristine upstream OSWorld, then copies each file
+# below into place on top of it. Keeping these here (version-controlled in
+# CUAEval) rather than loose inside an OSWorld checkout is the whole point: a
+# fresh clone + this manifest reproduces the custom harness deterministically.
+#
+# A future harness = a sibling adapters/<name>/ dir with its own manifest.yaml.
+# `src` is relative to THIS directory; `dest` is relative to the OSWorld repo
+# root. The two happen to match here because the folder mirrors OSWorld's layout,
+# but they need not — `dest` is authoritative.
+
+name: holo3
+description: >-
+  Custom harness on top of Holo3.1 — an OpenAI-compatible CUA agent (Holo3Agent)
+  plus its OSWorld multi-env runner. Talks to any endpoint via OPENAI_BASE_URL,
+  so it serves equally against a local Docker server or a tunnelled vast.ai box.
+
+# The run_multienv_<runner>.py this adapter provides. `cuaeval bootstrap` verifies
+# this script exists after copying, and plans that set `runner: holo3` resolve to it.
+runner: holo3
+
+files:
+  - src: mm_agents/holo3_agent.py
+    dest: mm_agents/holo3_agent.py
+  - src: mm_agents/holo3_format.py
+    dest: mm_agents/holo3_format.py
+  - src: scripts/python/run_multienv_holo3.py
+    dest: scripts/python/run_multienv_holo3.py
+  - src: scripts/python/holo3_grounding_smoketest.py
+    dest: scripts/python/holo3_grounding_smoketest.py

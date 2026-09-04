@@ -1,16 +1,24 @@
 """CLI entry point.
 
-    cuaeval run   plans/example.yaml [--dry-run] [--only LABEL ...] [--keep-going]
-    cuaeval check plans/example.yaml            # validate + print the resolved plan
+    cuaeval bootstrap plans/example.yaml [--dry-run] [--force]  # clone OSWorld + adapters
+    cuaeval run       plans/example.yaml [--dry-run] [--only LABEL ...] [--keep-going]
+    cuaeval check     plans/example.yaml        # validate + print the resolved plan
 """
 from __future__ import annotations
 
 import argparse
 import sys
 
+from .bootstrap import bootstrap
 from .config import load_plan
 from .orchestrator import run_plan
 from .util import log, setup_logging
+
+
+def _cmd_bootstrap(args: argparse.Namespace) -> int:
+    plan = load_plan(args.plan)
+    bootstrap(plan, dry_run=args.dry_run, force=args.force)
+    return 0
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
@@ -53,6 +61,15 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--keep-going", action="store_true",
                    help="continue to the next job if one fails")
     r.set_defaults(func=_cmd_run)
+
+    b = sub.add_parser("bootstrap",
+                       help="clone OSWorld at the pinned ref + copy adapters into place")
+    b.add_argument("plan")
+    b.add_argument("--dry-run", action="store_true",
+                   help="print every git/venv/copy step without executing")
+    b.add_argument("--force", action="store_true",
+                   help="overwrite adapter files that already exist in the checkout")
+    b.set_defaults(func=_cmd_bootstrap)
 
     c = sub.add_parser("check", help="validate a plan and print the resolved jobs")
     c.add_argument("plan")

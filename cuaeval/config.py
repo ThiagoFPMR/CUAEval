@@ -24,6 +24,40 @@ DEFAULT_IMAGES = {
 
 
 @dataclass
+class VastConfig:
+    """Optional vast.ai instance lifecycle for a `remote` job.
+
+    `provision` (do I create the box?) and `destroy` (do I kill it on teardown?)
+    are independent: you can destroy a box you handed CUAEval by ssh_host, and you
+    can keep a box CUAEval created. `destroy` defaults to mirroring `provision`.
+    """
+    provision: bool = False           # create a fresh instance for this job
+    destroy: bool | None = None       # kill on teardown; None => same as `provision`
+    keep_on_error: bool = False       # if the job errored, skip destroy (leave it for debugging)
+    instance_id: int | None = None    # reuse this instance (provision=False) or the id to destroy
+
+    # create-time offer selection (used only when provision=True)
+    query: str | None = None          # raw `vastai search offers` query; overrides gpu_name/num_gpus
+    gpu_name: str | None = None        # e.g. "RTX_4090" (used to build the query if `query` unset)
+    num_gpus: int = 1
+    image: str | None = None          # instance base image (default: DEFAULT_IMAGES[framework])
+    disk: int = 60                    # GB
+    label: str | None = None          # vast instance label (default: cuaeval-<job label>)
+    onstart_cmd: str | None = None    # optional onstart script contents
+    create_args: list[str] = field(default_factory=list)  # extra argv to `vastai create instance`
+
+    # how CUAEval reaches the box over SSH (an alias is written to ~/.cuaeval/ssh_config)
+    ssh_alias: str | None = None      # default: cuaeval-vast-<instance_id>
+    ssh_user: str = "root"            # vast default
+    identity_file: str | None = None  # SSH key for the alias (default: your agent / ~/.ssh keys)
+
+    wait_timeout: int = 1200          # secs to wait for the instance to reach 'running' + sshd up
+
+    def resolved_destroy(self) -> bool:
+        return self.provision if self.destroy is None else self.destroy
+
+
+@dataclass
 class ServeConfig:
     # where + how to serve
     location: str = "remote"          # "local" (docker here) | "remote" (vast.ai)
@@ -44,7 +78,8 @@ class ServeConfig:
     container_name: str = "cuaeval-serve"
 
     # remote (vast.ai) only
-    ssh_host: str = ""                # ssh alias/target of the instance
+    ssh_host: str = ""                # ssh alias/target of the instance (derived if vast.provision)
+    vast: VastConfig = field(default_factory=VastConfig)  # optional instance lifecycle
     tunnel_port: int | None = None    # local port forwarded to the remote `port` (default: port)
     tmux_session: str = "cuaeval-serve"
     remote_models_dir: str = "/models"      # where weights are staged on the instance
@@ -79,9 +114,26 @@ class JobConfig:
     max_steps: int = 15
     num_envs: int = 4
     domain: str | None = None         # None => all domains
-    provider_name: str = "vmware"
+    provider_name: str = "vmware"     # OSWorld VM provider: aws | docker | vmware | ...
+    region: str = "us-east-1"         # AWS region (only used when provider_name=aws)
     runner_args: list[str] = field(default_factory=list)  # extra argv to the runner
     api_key: str = "EMPTY"            # OPENAI_API_KEY sent to the runner
+
+
+@dataclass
+class OSWorldSource:
+    """How `cuaeval bootstrap` provisions the OSWorld checkout at `osworld_repo`.
+
+    A pristine upstream OSWorld is cloned at a pinned `ref`, its venv is built,
+    then each named adapter set (CUAEval/adapters/<name>/) is copied on top. This
+    keeps OSWorld upgradable (bump `ref`) while the custom harness lives, version
+    controlled, in CUAEval.
+    """
+    repo_url: str = "https://github.com/xlang-ai/OSWorld"
+    ref: str | None = None            # commit SHA or tag to pin; None => default branch (warns)
+    adapters: list[str] = field(default_factory=list)  # adapter set names under CUAEval/adapters/
+    python: str = "python3"           # interpreter used to build the repo's .venv
+    pip_install: bool = True          # pip install -r requirements.txt into that venv
 
 
 @dataclass
@@ -89,6 +141,7 @@ class Plan:
     osworld_repo: Path
     osworld_python: str               # interpreter used to run the OSWorld runner
     jobs: list[JobConfig]
+    osworld: OSWorldSource = field(default_factory=OSWorldSource)
 
 
 def _filter_known(cls, data: dict[str, Any]) -> dict[str, Any]:
@@ -129,6 +182,8 @@ def load_plan(path: str | Path) -> Plan:
         str(venv_py) if venv_py.exists() else "python3"
     )
 
+    osworld_src = OSWorldSource(**_filter_known(OSWorldSource, raw.get("osworld", {}) or {}))
+
     defaults = raw.get("defaults", {}) or {}
     jobs_raw = raw.get("jobs") or []
     if not jobs_raw:
@@ -139,8 +194,11 @@ def load_plan(path: str | Path) -> Plan:
     for i, jr in enumerate(jobs_raw):
         merged = _deep_merge(defaults, jr)
         serve_raw = merged.pop("serve", {}) or {}
+        vast_raw = serve_raw.pop("vast", {}) or {}
         job_kwargs = _filter_known(JobConfig, merged)
-        job_kwargs["serve"] = ServeConfig(**_filter_known(ServeConfig, serve_raw))
+        serve_kwargs = _filter_known(ServeConfig, serve_raw)
+        serve_kwargs["vast"] = VastConfig(**_filter_known(VastConfig, vast_raw))
+        job_kwargs["serve"] = ServeConfig(**serve_kwargs)
         if "label" not in job_kwargs or "weights" not in job_kwargs:
             raise ValueError(f"job #{i} is missing required key 'label' and/or 'weights'")
         job = JobConfig(**job_kwargs)
@@ -152,7 +210,8 @@ def load_plan(path: str | Path) -> Plan:
         _validate_job(job)
         jobs.append(job)
 
-    return Plan(osworld_repo=repo, osworld_python=osworld_python, jobs=jobs)
+    return Plan(osworld_repo=repo, osworld_python=osworld_python, jobs=jobs,
+                osworld=osworld_src)
 
 
 def _validate_job(job: JobConfig) -> None:
@@ -161,8 +220,13 @@ def _validate_job(job: JobConfig) -> None:
         raise ValueError(f"{job.label}: serve.location must be 'local' or 'remote'")
     if s.framework not in ("sglang", "vllm"):
         raise ValueError(f"{job.label}: serve.framework must be 'sglang' or 'vllm'")
-    if s.location == "remote" and not s.ssh_host:
-        raise ValueError(f"{job.label}: remote serving requires serve.ssh_host")
+    if s.location == "remote" and not s.ssh_host and not s.vast.provision:
+        raise ValueError(f"{job.label}: remote serving requires serve.ssh_host "
+                         "(or serve.vast.provision: true to create a box)")
+    if s.location == "remote" and s.vast.resolved_destroy() and not s.vast.provision \
+            and s.vast.instance_id is None and not s.ssh_host:
+        raise ValueError(f"{job.label}: serve.vast.destroy needs a way to identify the "
+                         "box — set serve.vast.instance_id or serve.ssh_host")
     if s.location == "local" and not s.resolved_image():
         raise ValueError(f"{job.label}: no docker image for framework {s.framework!r}; "
                          "set serve.image")

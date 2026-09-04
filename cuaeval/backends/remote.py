@@ -26,9 +26,10 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from ..config import JobConfig
+from ..config import DEFAULT_IMAGES, JobConfig
 from ..models import build_launch_args, is_s3
 from ..util import fmt_cmd, log, run
+from ..vast import VastManager, write_ssh_alias
 from .base import ServerBackend
 
 _BUNDLE_DIR = Path(__file__).resolve().parent.parent / "remote"
@@ -166,3 +167,65 @@ class RemoteProcessServer(ServerBackend):
                 self._tunnel.kill()
             self._tunnel = None
         self._launched = False
+
+
+class VastRemoteServer(RemoteProcessServer):
+    """RemoteProcessServer that also owns the vast.ai *instance* lifecycle.
+
+    On start it optionally rents a box (and derives serve.ssh_host from it); on
+    stop it optionally destroys the box — independently, so a box you provided by
+    ssh_host can still be destroyed, and a box CUAEval rented can be kept. Destroy
+    runs in a finally after the normal serve/tunnel teardown, so a rented box is
+    never leaked even if the job errored (unless vast.keep_on_error).
+    """
+
+    def __init__(self, job: JobConfig, *, dry_run: bool = False) -> None:
+        super().__init__(job, dry_run=dry_run)
+        self._vast = VastManager(dry_run=dry_run)
+        self._instance_id: int | None = None   # box to destroy on teardown, if any
+        self._errored = False
+
+    def start(self) -> None:
+        v = self.serve.vast
+        if v.provision:
+            image = v.image or DEFAULT_IMAGES.get(self.serve.framework, "")
+            if not image:
+                raise ValueError(f"{self.job.label}: no vast image for framework "
+                                 f"{self.serve.framework!r}; set serve.vast.image")
+            label = v.label or f"cuaeval-{self.job.label}"
+            offer = self._vast.search_offer(v)
+            self._instance_id = self._vast.create(offer, v, image, label)
+            host, port = self._vast.wait_running(self._instance_id, v)
+            alias = v.ssh_alias or f"cuaeval-vast-{self._instance_id or 'dryrun'}"
+            write_ssh_alias(alias, host, port, v, dry_run=self.dry_run)
+            self.serve.ssh_host = alias        # parent's ssh/rsync/scp/tunnel use this
+        elif v.resolved_destroy():
+            # Reusing a box we must later destroy: resolve its id up front.
+            self._instance_id = v.instance_id or self._vast.find_by_ssh(self.serve.ssh_host)
+            if self._instance_id is None and not self.dry_run:
+                log.warning("vast.destroy is set but the instance id for %r could not be "
+                            "resolved — the box will NOT be destroyed. Set "
+                            "serve.vast.instance_id.", self.serve.ssh_host)
+        super().start()
+
+    def stop(self) -> None:
+        try:
+            super().stop()
+        finally:
+            self._maybe_destroy()
+
+    def _maybe_destroy(self) -> None:
+        v = self.serve.vast
+        if not v.resolved_destroy() or self._instance_id is None:
+            return
+        if v.keep_on_error and self._errored:
+            log.warning("job errored and vast.keep_on_error set — leaving instance %s up "
+                        "for debugging (destroy it yourself: vastai destroy instance %s)",
+                        self._instance_id, self._instance_id)
+            return
+        self._vast.destroy(self._instance_id)
+        self._instance_id = None
+
+    def __exit__(self, *exc) -> None:
+        self._errored = exc[0] is not None
+        super().__exit__(*exc)
