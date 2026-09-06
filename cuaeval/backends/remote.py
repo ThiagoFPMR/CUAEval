@@ -115,15 +115,17 @@ class RemoteProcessServer(ServerBackend):
         s = self.serve
         model_dir = self._remote_model_dir()
         launch = build_launch_args(s, model_dir, self.job.label)
-        # env consumed by deploy.sh (non-secret; safe to appear in ps/logs)
-        env = {
+        # env consumed by deploy.sh (non-secret; safe to appear in ps/logs).
+        # serve.env goes in first so the keys deploy.sh requires always win.
+        env = {str(k): str(v) for k, v in s.env.items()}
+        env.update({
             "CUAEVAL_PYTHON": s.remote_python,
             "MODEL_SRC": self.job.weights,
             "MODEL_DIR": model_dir,
             "IS_B2": "1" if is_b2(self.job.weights) else "0",
             "B2_WORKERS": "4",
             "SERVE_ARGS": " ".join(shlex.quote(a) for a in launch),
-        }
+        })
         env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
         # remote_workdir raw so tmux's `sh -c` expands ~ (see _sync_bundle note).
         inner = (f"cd {s.remote_workdir} && "

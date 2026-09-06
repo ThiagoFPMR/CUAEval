@@ -90,6 +90,9 @@ def _clone(repo_url: str, ref: str | None, repo: Path, *, dry_run: bool) -> None
 
 
 def _build_venv(repo: Path, python: str, *, pip_install: bool, dry_run: bool) -> None:
+    # Absolute: the pip install below runs with cwd=repo, and a relative program
+    # path would be resolved against THAT, not against our own cwd.
+    repo = repo.resolve()
     venv = repo / ".venv"
     if venv.exists():
         log.info("venv already present at %s — skipping create", venv)

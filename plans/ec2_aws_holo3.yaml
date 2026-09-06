@@ -74,17 +74,21 @@ defaults:
     tunnel_port: 9091           # local port CUAEval forwards it to
     tp: 1                       # tensor-parallel = GPUs to use on the box
     context_length: 32768
-    remote_models_dir: /models  # only used to stage b2:// weights; inert for
-                                # absolute paths like the ones below
+    extra_args:
+      # This checkpoint is a hybrid attention/Mamba model: every concurrent decode
+      # sequence needs its own Mamba cache block, and only ~728 fit at
+      # gpu_memory_utilization 0.9. vLLM's default max_num_seqs of 1024 exceeds
+      # that and aborts CUDA graph capture. Our real concurrency is num_envs.
+      - --max-num-seqs
+      - "64"
+    remote_models_dir: /models
+    env:
+      # This image ships the CUDA runtime but no toolkit (no nvcc), so FlashInfer
+      # cannot JIT its sampling kernel. Use vLLM's native top-k/top-p sampler.
+      VLLM_USE_FLASHINFER_SAMPLER: "0"
     vast:
-      # CUAEval neither rents nor destroys the box: it just serves on it.
       provision: false
       destroy: false
-      # The fields below are read ONLY when provision: true — kept here so you can
-      # flip back to a rent-per-job box without looking them up again.
-      # gpu_name: RTX_PRO_6000_WS
-      # num_gpus: 1
-      # disk: 512
 
 # `weights` are paths ON THE VAST BOX (not on this EC2 host). deploy.sh checks
 # each one exists before launching and fails loudly if it does not.

@@ -71,6 +71,8 @@ class ServeConfig:
     trust_remote_code: bool = True
     extra_args: list[str] = field(default_factory=list)  # appended to the launch cmd
     command: list[str] | None = None  # full launch argv override (advanced escape hatch)
+    env: dict[str, str] = field(default_factory=dict)  # extra env vars for the server
+                                     # process (e.g. VLLM_USE_FLASHINFER_SAMPLER: "0")
 
     # local-docker only
     image: str | None = None          # defaults to DEFAULT_IMAGES[framework]
@@ -199,7 +201,10 @@ def load_plan(path: str | Path) -> Plan:
 
     if "osworld_repo" not in raw:
         raise ValueError("plan is missing required top-level key: osworld_repo")
-    repo = Path(raw["osworld_repo"]).expanduser()
+    # Absolute: commands are run with cwd=repo, so any relative path derived
+    # from it (the venv python, the runner script) would resolve against THAT
+    # rather than against our own cwd.
+    repo = Path(raw["osworld_repo"]).expanduser().resolve()
 
     # Default the OSWorld interpreter to the repo's own venv if present.
     venv_py = repo / ".venv" / "bin" / "python"
