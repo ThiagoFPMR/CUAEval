@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 from PIL import Image, ImageDraw  # noqa: E402
 
 from mm_agents.holo3_agent import Holo3Agent, json_schema_response_format  # noqa: E402
-from mm_agents.holo3_format import ClickAction, build_localization_messages  # noqa: E402
+from mm_agents.holo3_format import LocalizerOutput, build_localization_messages  # noqa: E402
 
 
 def main() -> int:
@@ -59,15 +59,19 @@ def main() -> int:
     buf = BytesIO(); img.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-    agent = Holo3Agent(model=args.model)
+    # Grounding is single-shot with thinking off (H's element-localization surface).
+    agent = Holo3Agent(model=args.model, enable_thinking=False)
     agent.reset()
 
-    messages = agent._inline_image(
-        build_localization_messages(instruction=args.element, image_path="__CURRENT__"), b64)
+    messages = agent._inline_images(
+        build_localization_messages(instruction=args.element, image=b64))
 
     print(f"[cfg] endpoint={args.base_url}  model={args.model}  image={W}x{H}")
     print(f"[cfg] element={args.element!r}\n")
-    raw = agent.call_llm(messages, 256, json_schema_response_format(ClickAction, "click"))
+    # Grounding runs with thinking off; force clean JSON so a bare endpoint that
+    # rambles still yields a Click(x, y) to read the coordinate convention from.
+    raw = agent.call_llm(messages, 256, temperature=0.0,
+                         response_format=json_schema_response_format(LocalizerOutput, "localize"))
     print("=== RAW model response ===")
     print(raw or "(empty)")
     print("==========================\n")

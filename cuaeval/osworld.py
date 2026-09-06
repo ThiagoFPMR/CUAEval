@@ -38,7 +38,11 @@ def build_command(plan: Plan, job: JobConfig) -> list[str]:
     ]
     if job.provider_name == "aws":
         cmd += ["--region", job.region]
-    if job.domain and job.domain != "all":
+    # domains (list) subsets the meta to several domains; domain (single) is the
+    # legacy one-domain filter. config validation forbids setting both.
+    if job.domains:
+        cmd += ["--domains", ",".join(job.domains)]
+    elif job.domain and job.domain != "all":
         cmd += ["--domain", job.domain]
     cmd += job.runner_args
     return cmd

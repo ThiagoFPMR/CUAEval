@@ -4,9 +4,12 @@ This is the "clone CUAEval into a fresh EC2 box and it sets everything up" piece
 
     1. git clone a PRISTINE upstream OSWorld into `osworld_repo`, pinned at `ref`;
     2. build its .venv and pip install -r requirements.txt;
-    3. copy each named adapter set (CUAEval/adapters/<name>/) on top per its
+    3. vendor our custom evaluation metas (CUAEval/evaluation_examples/) into the
+       checkout — these task lists (e.g. test_nogdrive.json) are ours, not shipped
+       by upstream OSWorld, and plans reference them via `meta:`;
+    4. copy each named adapter set (CUAEval/adapters/<name>/) on top per its
        manifest, so the custom harness (e.g. Holo3) lands in the right places;
-    4. verify each adapter's runner script now resolves.
+    5. verify each adapter's runner script now resolves.
 
 Idempotent: an existing checkout is left in place (use --force to re-copy
 adapters over it; a clean re-clone means removing the dir yourself). Nothing
@@ -25,6 +28,9 @@ from .util import log, run
 
 # CUAEval/adapters/  (this file is CUAEval/cuaeval/bootstrap.py)
 ADAPTERS_ROOT = Path(__file__).resolve().parent.parent / "adapters"
+# CUAEval/evaluation_examples/ — custom OSWorld task metas we keep version-controlled
+# here and copy into the checkout's evaluation_examples/ (upstream doesn't ship them).
+META_ROOT = Path(__file__).resolve().parent.parent / "evaluation_examples"
 
 
 @dataclass
@@ -59,6 +65,7 @@ def bootstrap(plan: Plan, *, dry_run: bool = False, force: bool = False) -> None
 
     _clone(src.repo_url, src.ref, repo, dry_run=dry_run)
     _build_venv(repo, src.python, pip_install=src.pip_install, dry_run=dry_run)
+    _vendor_metas(repo, dry_run=dry_run, force=force)
 
     for name in src.adapters:
         _apply_adapter(AdapterManifest.load(name), repo, dry_run=dry_run, force=force)
@@ -98,6 +105,34 @@ def _build_venv(repo: Path, python: str, *, pip_install: bool, dry_run: bool) ->
         return
     log.info("installing OSWorld requirements (this can take a while)")
     run([str(pip), "install", "-r", str(req)], cwd=str(repo), dry_run=dry_run)
+
+
+def _vendor_metas(repo: Path, *, dry_run: bool, force: bool) -> None:
+    """Copy CUAEval/evaluation_examples/* into <repo>/evaluation_examples/.
+
+    These are our custom task lists (e.g. test_nogdrive.json) that upstream OSWorld
+    doesn't ship; a plan's `meta:` points at one of them. We keep only the CUSTOM
+    metas here, so this never touches upstream files like test_all.json. Idempotent:
+    an existing file is left in place unless `force`.
+    """
+    if not META_ROOT.exists():
+        return
+    metas = sorted(p for p in META_ROOT.rglob("*") if p.is_file() and p.name != "README.md")
+    if not metas:
+        return
+    dest_root = repo / "evaluation_examples"
+    log.info("vendoring %d custom eval meta(s) -> %s", len(metas), dest_root)
+    for src in metas:
+        rel = src.relative_to(META_ROOT)
+        dest = dest_root / rel
+        if dest.exists() and not force:
+            log.warning("  skip (exists, use --force to overwrite): evaluation_examples/%s", rel)
+            continue
+        log.info("  copy evaluation_examples/%s", rel)
+        if dry_run:
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
 
 
 def _apply_adapter(m: AdapterManifest, repo: Path, *, dry_run: bool, force: bool) -> None:

@@ -1,5 +1,5 @@
 # Example CUAEval plan: test three Holo3 checkpoints on OSWorld, back to back.
-# The first two serve on a vast.ai box (process-based, S3 weights); the third
+# The first two serve on a vast.ai box (process-based, Backblaze B2 weights); the third
 # serves locally in Docker from already-downloaded weights.
 #
 #   cuaeval check plans/example.yaml          # validate + show resolved jobs
@@ -38,10 +38,12 @@ defaults:
 
 jobs:
   - label: holo3-gimp-pruned-half
-    weights: s3://omnibrowse-s3/models/holo3-gimp-pruned-half
+    weights: b2://omnibrowse-b2/models/holo3-gimp-pruned-half
+    # Restrict this run to a subset of the meta's domains (omit for all of them):
+    # domains: [gimp, chrome]
 
   - label: holo3-gimp-pruned-quarter
-    weights: s3://omnibrowse-s3/models/holo3-gimp-pruned-quarter
+    weights: b2://omnibrowse-b2/models/holo3-gimp-pruned-quarter
 
   # A locally-served model (Docker on this host) from already-downloaded weights.
   - label: holo3-gimp-local

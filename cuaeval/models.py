@@ -1,7 +1,8 @@
 """Weight-source classification + server launch-command construction.
 
 A job's `weights` string is one of:
-  * an s3:// URI            -> must be staged (downloaded) before serving
+  * a b2:// URI             -> must be staged (downloaded from Backblaze B2)
+                               before serving
   * a filesystem path       -> used in place (local job: path on this host;
                                remote job: path already on the vast instance)
 
@@ -14,12 +15,12 @@ from __future__ import annotations
 from .config import ServeConfig
 
 
-def is_s3(weights: str) -> bool:
-    return weights.startswith("s3://")
+def is_b2(weights: str) -> bool:
+    return weights.startswith("b2://")
 
 
 def local_stage_dir(weights: str, models_root: str) -> str:
-    """Where an s3:// checkpoint gets staged: <models_root>/<basename-of-uri>."""
+    """Where a b2:// checkpoint gets staged: <models_root>/<basename-of-uri>."""
     from pathlib import PurePosixPath
     base = PurePosixPath(weights.rstrip("/")).name
     return f"{models_root.rstrip('/')}/{base}"

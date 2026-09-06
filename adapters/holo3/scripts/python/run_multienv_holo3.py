@@ -61,19 +61,35 @@ def config() -> argparse.Namespace:
     parser.add_argument("--model", type=str, default="omnibrowse")
     parser.add_argument("--temperature", type=float, default=0)
     parser.add_argument("--top_p", type=float, default=0.9)
-    parser.add_argument("--max_tokens", type=int, default=2048)
+    parser.add_argument(
+        "--max_tokens",
+        type=int,
+        default=4096,
+        help="Generation cap for the agent loop. 4096 matches CUAPruning's "
+             "LOOP_MAX_TOKENS -- thinking is on, so the answer needs room after "
+             "the reasoning pass.",
+    )
     parser.add_argument("--stop_token", type=str, default=None)
     parser.add_argument(
         "--history_length",
         type=int,
-        default=12,
-        help="Number of prior steps to include in the prompt (matches training).",
+        default=6,
+        help="Number of prior agent-loop steps replayed into the prompt. "
+             "6 matches CUAPruning's HISTORY_LENGTH (the serving agent default).",
     )
     parser.add_argument(
         "--keep_n_observations",
         type=int,
         default=3,
-        help="Most-recent prior steps that keep their <observation> text.",
+        help="Most-recent screenshots kept as images (the image budget); older "
+             "<observation>s keep their wrapper but their pixels become a text "
+             "placeholder. 3 matches CUAPruning's IMAGE_BUDGET.",
+    )
+    parser.add_argument(
+        "--disable_thinking",
+        action="store_true",
+        help="Turn off the reasoning channel. On by default: the agent loop was "
+             "profiled/pruned with thinking on (chat_template_kwargs enable_thinking).",
     )
     parser.add_argument(
         "--invert_scroll",
@@ -96,6 +112,9 @@ def config() -> argparse.Namespace:
 
     # example config
     parser.add_argument("--domain", type=str, default="all")
+    # Comma-separated subset of domains to run from the meta (e.g. "chrome,vlc").
+    # Takes precedence over --domain; empty means "all domains in the meta".
+    parser.add_argument("--domains", type=str, default="")
     parser.add_argument(
         "--test_all_meta_path", type=str, default="evaluation_examples/test_nogdrive.json"
     )
@@ -231,6 +250,8 @@ def run_env_tasks(task_queue, args: argparse.Namespace, shared_scores: list):
             action_space=args.action_space,
             observation_type=args.observation_type,
             history_length=args.history_length,
+            image_budget=args.keep_n_observations,
+            enable_thinking=not args.disable_thinking,
             invert_scroll=args.invert_scroll,
             max_parse_retries=args.max_parse_retries,
             retry_temperature=args.retry_temperature,
@@ -487,8 +508,19 @@ if __name__ == "__main__":
         with open(args.test_all_meta_path, "r", encoding="utf-8") as f:
             test_all_meta = json.load(f)
 
-        if args.domain != "all":
-            test_all_meta = {args.domain: test_all_meta[args.domain]}
+        # Domain filtering: --domains (comma-separated list) wins over the legacy
+        # single --domain. Fail loudly if a requested domain isn't in the meta.
+        requested = [d.strip() for d in args.domains.split(",") if d.strip()]
+        if not requested and args.domain != "all":
+            requested = [args.domain]
+        if requested:
+            missing = [d for d in requested if d not in test_all_meta]
+            if missing:
+                raise KeyError(
+                    f"domain(s) {missing} not in {args.test_all_meta_path} "
+                    f"(available: {sorted(test_all_meta)})"
+                )
+            test_all_meta = {d: test_all_meta[d] for d in requested}
 
         test_file_list = get_unfinished(
             args.action_space,

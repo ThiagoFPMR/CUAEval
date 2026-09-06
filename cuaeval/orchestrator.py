@@ -5,9 +5,12 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from .b2 import B2_APP_KEY_ENV, B2_ENDPOINT_ENV, B2_KEY_ID_ENV
 from .backends import make_backend
 from .config import JobConfig, Plan
+from .models import is_b2
 from .osworld import read_score, run_benchmark, runner_script
+from .results import make_syncer
 from .util import log
 
 # Env vars OSWorld's `aws` provider needs to launch client VMs (see SETUP_GUIDELINE §3).
@@ -24,6 +27,7 @@ class JobResult:
     detail: str = ""
     num_examples: int | None = None
     score: float | None = None
+    results_synced: bool = True       # False => the Backblaze mirror of this job's results failed
 
 
 def _preflight(plan: Plan, *, dry_run: bool = False) -> None:
@@ -35,8 +39,10 @@ def _preflight(plan: Plan, *, dry_run: bool = False) -> None:
         )
     for job in plan.jobs:
         runner_script(plan.osworld_repo, job.runner)  # raises if missing
+    _preflight_results_sync(plan)
     if not dry_run:
         _preflight_aws(plan)
+        _preflight_b2_weights(plan)
 
 
 def _preflight_aws(plan: Plan) -> None:
@@ -49,6 +55,34 @@ def _preflight_aws(plan: Plan) -> None:
             "provider_name=aws needs these env vars set (see SETUP_GUIDELINE §3): "
             + ", ".join(missing)
         )
+
+
+def _preflight_b2_weights(plan: Plan) -> None:
+    """A b2:// checkpoint is unreachable without credentials + an endpoint. Say so
+    now rather than after renting a GPU box and waiting for the stage to fail."""
+    if not any(is_b2(j.weights) for j in plan.jobs):
+        return
+    missing = [v for v in (B2_KEY_ID_ENV, B2_APP_KEY_ENV, B2_ENDPOINT_ENV)
+               if not os.environ.get(v)]
+    if missing:
+        raise EnvironmentError(
+            "b2:// weights need these env vars set (see the README's Weights section): "
+            + ", ".join(missing)
+        )
+
+
+def _preflight_results_sync(plan: Plan) -> None:
+    """Results live on one un-backed-up EBS volume unless they're mirrored. That's
+    a whole campaign's worth of GPU time riding on one instance not dying, so say
+    so up front rather than at the end."""
+    cfg = plan.results_sync
+    if cfg is None or not cfg.enabled:
+        log.warning("no results_sync configured — benchmark results will exist ONLY on "
+                    "this host's disk. If it is terminated or reclaimed, the run is lost. "
+                    "Add a results_sync block to the plan (or pass --results-b2).")
+        return
+    log.info("results sync: %s (every %ds, videos=%s)",
+             cfg.b2_uri, cfg.interval, "yes" if cfg.include_videos else "no")
 
 
 def run_plan(plan: Plan, *, dry_run: bool = False, only: set[str] | None = None,
@@ -65,15 +99,20 @@ def run_plan(plan: Plan, *, dry_run: bool = False, only: set[str] | None = None,
         log.info("[%d/%d] JOB %r  serve=%s/%s  weights=%s",
                  i, len(jobs), job.label, job.serve.location, job.serve.framework,
                  job.weights)
+        syncer = make_syncer(plan, job, dry_run=dry_run)
         try:
-            _run_one(plan, job, dry_run=dry_run)
+            _run_one(plan, job, syncer, dry_run=dry_run)
             score = read_score(plan, job)
             res = JobResult(job.label, "ok",
                             num_examples=score[0] if score else None,
-                            score=score[1] if score else None)
+                            score=score[1] if score else None,
+                            results_synced=not syncer.failed)
         except Exception as exc:  # noqa: BLE001
             log.exception("job %r failed", job.label)
-            res = JobResult(job.label, "failed", detail=str(exc))
+            # The syncer's final pass has already run (its __exit__ fires on the
+            # way out of _run_one), so partial results are saved even here.
+            res = JobResult(job.label, "failed", detail=str(exc),
+                            results_synced=not syncer.failed)
             if not keep_going and not dry_run:
                 results.append(res)
                 _summary(results)
@@ -84,12 +123,15 @@ def run_plan(plan: Plan, *, dry_run: bool = False, only: set[str] | None = None,
     return results
 
 
-def _run_one(plan: Plan, job: JobConfig, *, dry_run: bool) -> None:
-    with make_backend(job, dry_run=dry_run) as backend:
-        backend.start()
-        backend.wait_ready()
-        run_benchmark(plan, job, backend.endpoint, dry_run=dry_run)
-    # backend.__exit__ -> stop(): unload the model before the next job.
+def _run_one(plan: Plan, job: JobConfig, syncer, *, dry_run: bool) -> None:
+    # Syncer OUTSIDE the backend so its final upload happens after the GPU box is
+    # torn down — stop paying for the instance first, then spend time on Backblaze.
+    with syncer:
+        with make_backend(job, dry_run=dry_run) as backend:
+            backend.start()
+            backend.wait_ready()
+            run_benchmark(plan, job, backend.endpoint, dry_run=dry_run)
+        # backend.__exit__ -> stop(): unload the model before the next job.
 
 
 def _summary(results: list[JobResult]) -> None:
@@ -102,3 +144,7 @@ def _summary(results: list[JobResult]) -> None:
         else:
             extra = f"  ({r.detail})" if r.detail else ""
             log.info("  %-28s %-8s%s", r.label, r.status, extra)
+    unsaved = [r.label for r in results if not r.results_synced]
+    if unsaved:
+        log.error("RESULTS NOT UPLOADED for: %s — they exist only on this host's "
+                  "disk. Copy them off before terminating it.", ", ".join(unsaved))

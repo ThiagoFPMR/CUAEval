@@ -85,12 +85,12 @@ class ServeConfig:
     remote_models_dir: str = "/models"      # where weights are staged on the instance
     remote_workdir: str = "~/.cuaeval"      # where the deploy bundle is rsynced
     remote_python: str = "python3"          # interpreter on the instance
-    aws_env: list[str] = field(default_factory=lambda: [
-        "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DEFAULT_REGION",
-    ])  # env var names forwarded to the instance for the S3 download
+    b2_env: list[str] = field(default_factory=lambda: [
+        "B2_ACCESS_KEY_ID", "B2_SECRET_ACCESS_KEY", "B2_S3_ENDPOINT", "B2_REGION",
+    ])  # env var names forwarded to the instance for the B2 weight download
 
     # timeouts (seconds)
-    up_timeout: int = 2400            # includes any S3 download before the server is ready
+    up_timeout: int = 2400            # includes any B2 download before the server is ready
     down_timeout: int = 180
     poll: int = 10
 
@@ -104,7 +104,7 @@ class ServeConfig:
 @dataclass
 class JobConfig:
     label: str                        # --model label + result subdir; must be unique
-    weights: str                      # local path, remote path, or s3:// URI
+    weights: str                      # local path, remote path, or b2:// URI
     serve: ServeConfig = field(default_factory=ServeConfig)
 
     # OSWorld runner selection + knobs
@@ -113,11 +113,35 @@ class JobConfig:
     result_dir: str = "./results"
     max_steps: int = 15
     num_envs: int = 4
-    domain: str | None = None         # None => all domains
+    domain: str | None = None         # single-domain filter (legacy; None/"all" => no filter)
+    domains: list[str] = field(default_factory=list)  # subset the meta to these domains ([] => all)
     provider_name: str = "vmware"     # OSWorld VM provider: aws | docker | vmware | ...
     region: str = "us-east-1"         # AWS region (only used when provider_name=aws)
     runner_args: list[str] = field(default_factory=list)  # extra argv to the runner
     api_key: str = "EMPTY"            # OPENAI_API_KEY sent to the runner
+
+
+@dataclass
+class ResultsSyncConfig:
+    """Mirror the OSWorld results tree to Backblaze B2 while the run is in progress.
+
+    Without this, results exist only on the host's EBS volume: a terminated or
+    spot-reclaimed host loses the whole campaign. Plan-level rather than per-job,
+    since the runner writes every job into one tree (nested by label).
+
+    Backblaze credentials come from the B2_ACCESS_KEY_ID / B2_SECRET_ACCESS_KEY
+    env vars (never baked in); the endpoint from `endpoint_url` or B2_S3_ENDPOINT.
+    The same credentials read model weights (see ServeConfig.b2_env).
+    """
+    b2_uri: str = ""                  # b2://bucket/prefix — required to enable
+    endpoint_url: str = ""            # Backblaze S3 endpoint; falls back to B2_S3_ENDPOINT
+    enabled: bool = True              # set false to keep the config but skip syncing
+    interval: int = 600               # secs between syncs DURING a job; <=0 = only at job end
+    include_videos: bool = True       # False => skip recording.mp4 (the bulk of the bytes)
+    exclude: list[str] = field(default_factory=list)  # extra globs (path or basename)
+    workers: int = 8                  # parallel uploads
+    run_id: str | None = None         # optional extra prefix to keep campaigns separate
+    join_timeout: int = 300           # secs to let an in-flight sync finish on teardown
 
 
 @dataclass
@@ -142,6 +166,7 @@ class Plan:
     osworld_python: str               # interpreter used to run the OSWorld runner
     jobs: list[JobConfig]
     osworld: OSWorldSource = field(default_factory=OSWorldSource)
+    results_sync: ResultsSyncConfig | None = None   # None => results stay on local disk
 
 
 def _filter_known(cls, data: dict[str, Any]) -> dict[str, Any]:
@@ -184,6 +209,12 @@ def load_plan(path: str | Path) -> Plan:
 
     osworld_src = OSWorldSource(**_filter_known(OSWorldSource, raw.get("osworld", {}) or {}))
 
+    sync_raw = raw.get("results_sync") or {}
+    results_sync = ResultsSyncConfig(**_filter_known(ResultsSyncConfig, sync_raw)) \
+        if sync_raw else None
+    if results_sync is not None:
+        _validate_results_sync(results_sync)
+
     defaults = raw.get("defaults", {}) or {}
     jobs_raw = raw.get("jobs") or []
     if not jobs_raw:
@@ -211,10 +242,29 @@ def load_plan(path: str | Path) -> Plan:
         jobs.append(job)
 
     return Plan(osworld_repo=repo, osworld_python=osworld_python, jobs=jobs,
-                osworld=osworld_src)
+                osworld=osworld_src, results_sync=results_sync)
+
+
+def _validate_results_sync(cfg: ResultsSyncConfig) -> None:
+    if cfg.enabled and not cfg.b2_uri:
+        raise ValueError("results_sync: b2_uri is required (or set enabled: false)")
+    if cfg.b2_uri and not cfg.b2_uri.startswith("b2://"):
+        raise ValueError(f"results_sync.b2_uri must be a b2:// URI: {cfg.b2_uri!r}")
+    if cfg.workers < 1:
+        raise ValueError("results_sync.workers must be >= 1")
 
 
 def _validate_job(job: JobConfig) -> None:
+    if job.domains:
+        if not isinstance(job.domains, list) or not all(
+            isinstance(d, str) and d.strip() for d in job.domains
+        ):
+            raise ValueError(f"{job.label}: domains must be a list of non-empty strings")
+        if job.domain and job.domain != "all":
+            raise ValueError(f"{job.label}: set either domain (single) or domains (list), not both")
+    if job.weights.startswith("s3://"):
+        raise ValueError(f"{job.label}: AWS S3 weights are no longer supported — "
+                         "copy the checkpoint to Backblaze B2 and use a b2:// URI")
     s = job.serve
     if s.location not in ("local", "remote"):
         raise ValueError(f"{job.label}: serve.location must be 'local' or 'remote'")

@@ -7,7 +7,8 @@
 # Installs the host-side toolchain (uv, awscli, the vast.ai CLI), syncs CUAEval's
 # own venv, then runs `cuaeval bootstrap` — which clones OSWorld at the plan's
 # pinned ref, builds its venv, and copies the adapters into place. After this you
-# only need to export your AWS + vast credentials and `cuaeval run` the plan.
+# only need to export your AWS + Backblaze + vast credentials and `cuaeval run`
+# the plan.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -46,7 +47,8 @@ if [[ -n "${VAST_API_KEY:-}" ]]; then
         log "WARN: could not set vast api-key; run 'vastai set api-key <key>' yourself"
 fi
 
-# --- awscli (optional convenience; boto3 in OSWorld's venv does the real work) -
+# --- awscli (optional convenience for the `aws` task-VM provider; boto3 in
+# --- OSWorld's venv does the real work) --------------------------------------
 if ! command -v aws >/dev/null 2>&1; then
     log "installing awscli"
     uv pip install awscli || true
@@ -60,12 +62,15 @@ cat <<EOF
 
 $(log "done.")
 Next steps:
-  1. Export the AWS host/client env (see SETUP_GUIDELINE §3):
+  1. Export the AWS host/client env for the task VMs (see SETUP_GUIDELINE §3):
        export AWS_ACCESS_KEY_ID=...  AWS_SECRET_ACCESS_KEY=...
        export AWS_SECURITY_GROUP_ID=sg-...  AWS_SUBNET_ID=subnet-...
        export AWS_DEFAULT_REGION=us-east-1
-  2. Make sure the vast.ai api key is set (export VAST_API_KEY=... or 'vastai set api-key').
-  3. Preview, then run:
+  2. Export the Backblaze B2 env (model weights in, results out):
+       export B2_ACCESS_KEY_ID=...  B2_SECRET_ACCESS_KEY=...
+       export B2_S3_ENDPOINT=https://s3.us-west-004.backblazeb2.com
+  3. Make sure the vast.ai api key is set (export VAST_API_KEY=... or 'vastai set api-key').
+  4. Preview, then run:
        uv run cuaeval run $PLAN --dry-run
        uv run cuaeval run $PLAN
 EOF

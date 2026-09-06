@@ -4,19 +4,19 @@ A vast.ai instance is itself a container with no usable docker daemon, so we do
 NOT `docker run` there. Instead the instance is rented from a stock sglang/vllm
 image (its base image already provides the server), and CUAEval:
 
-  1. rsyncs a tiny deploy bundle (deploy.sh + s3.py) to the instance;
+  1. rsyncs a tiny deploy bundle (deploy.sh + b2.py) to the instance;
   2. runs deploy.sh inside a detached tmux session — it stages the weights
-     (S3 download via s3.py, or a pre-staged path) then launches the server as a
-     foreground process the tmux session holds;
+     (Backblaze B2 download via b2.py, or a pre-staged path) then launches the
+     server as a foreground process the tmux session holds;
   3. opens an SSH tunnel so the endpoint is reachable at http://localhost:PORT/v1.
 
 Switching models = killing the tmux session (kills the process, frees VRAM);
 staged weights stay on the instance disk for warm reruns. This mirrors the vast
 path of OSWorld/run_two_models_holo3.sh, generalised and self-managing.
 
-AWS credentials for the S3 download are written to a 0600 aws.env on the instance
-(sourced by deploy.sh) rather than placed on the command line, so they never
-appear in `ps` output or in CUAEval's logs.
+Backblaze credentials for the weight download are written to a 0600 b2.env on
+the instance (sourced by deploy.sh) rather than placed on the command line, so
+they never appear in `ps` output or in CUAEval's logs.
 """
 from __future__ import annotations
 
@@ -27,13 +27,13 @@ import tempfile
 from pathlib import Path
 
 from ..config import DEFAULT_IMAGES, JobConfig
-from ..models import build_launch_args, is_s3
+from ..models import build_launch_args, is_b2
 from ..util import fmt_cmd, log, run
 from ..vast import VastManager, write_ssh_alias
 from .base import ServerBackend
 
 _BUNDLE_DIR = Path(__file__).resolve().parent.parent / "remote"
-_S3_PY = Path(__file__).resolve().parent.parent / "s3.py"
+_B2_PY = Path(__file__).resolve().parent.parent / "b2.py"
 
 
 class RemoteProcessServer(ServerBackend):
@@ -53,7 +53,7 @@ class RemoteProcessServer(ServerBackend):
 
     def _remote_model_dir(self) -> str:
         """Path the server loads from on the instance."""
-        if is_s3(self.job.weights):
+        if is_b2(self.job.weights):
             base = self.job.weights.rstrip("/").rsplit("/", 1)[-1]
             return f"{self.serve.remote_models_dir.rstrip('/')}/{base}"
         return self.job.weights  # pre-staged path on the instance
@@ -62,7 +62,7 @@ class RemoteProcessServer(ServerBackend):
     def start(self) -> None:
         self._preflight()
         self._sync_bundle()
-        self._push_aws_env()
+        self._push_b2_env()
         self._launch()
         self._open_tunnel()
         self._launched = True
@@ -81,23 +81,24 @@ class RemoteProcessServer(ServerBackend):
         log.info("rsyncing deploy bundle -> %s:%s", self.serve.ssh_host, workdir)
         self._ssh(f"mkdir -p {workdir}")
         run(["rsync", "-az",
-             f"{_BUNDLE_DIR}/", str(_S3_PY),
+             f"{_BUNDLE_DIR}/", str(_B2_PY),
              f"{self.serve.ssh_host}:{workdir}/"], dry_run=self.dry_run)
 
-    def _push_aws_env(self) -> None:
-        """Write AWS creds (from this host's env) to a 0600 aws.env on the instance,
-        keeping them off the command line. Skipped for non-S3 (pre-staged) weights."""
-        if not is_s3(self.job.weights):
+    def _push_b2_env(self) -> None:
+        """Write the Backblaze creds + endpoint (from this host's env) to a 0600
+        b2.env on the instance, keeping them off the command line. Skipped for
+        non-B2 (pre-staged) weights."""
+        if not is_b2(self.job.weights):
             return
         lines = [f"export {name}={shlex.quote(os.environ[name])}"
-                 for name in self.serve.aws_env if os.environ.get(name)]
-        remote_path = f"{self.serve.remote_workdir}/aws.env"
+                 for name in self.serve.b2_env if os.environ.get(name)]
+        remote_path = f"{self.serve.remote_workdir}/b2.env"
         if not lines:
-            log.warning("no AWS_* env vars set locally; S3 download on the instance "
-                        "will rely on the instance's own credentials/role.")
+            log.warning("no B2_* env vars set locally; the weight download on the "
+                        "instance will fail unless the box already has its own.")
             return
         if self.dry_run:
-            log.info("[dry-run] would write %d AWS var(s) to %s:%s (values hidden)",
+            log.info("[dry-run] would write %d B2 var(s) to %s:%s (values hidden)",
                      len(lines), self.serve.ssh_host, remote_path)
             return
         with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as tf:
@@ -119,8 +120,8 @@ class RemoteProcessServer(ServerBackend):
             "CUAEVAL_PYTHON": s.remote_python,
             "MODEL_SRC": self.job.weights,
             "MODEL_DIR": model_dir,
-            "IS_S3": "1" if is_s3(self.job.weights) else "0",
-            "S3_WORKERS": "4",
+            "IS_B2": "1" if is_b2(self.job.weights) else "0",
+            "B2_WORKERS": "4",
             "SERVE_ARGS": " ".join(shlex.quote(a) for a in launch),
         }
         env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())

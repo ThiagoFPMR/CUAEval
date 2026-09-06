@@ -1,7 +1,7 @@
 """Local serving = a Docker container of a stock sglang/vllm image on THIS host
 (the same machine that runs the OSWorld VMs — it has a real docker daemon).
 
-Flow: stage s3:// weights locally (skip if already present) -> `docker run -d`
+Flow: stage b2:// weights locally (skip if already present) -> `docker run -d`
 the image with the weights dir mounted and the server port published -> endpoint
 is http://localhost:PORT/v1. stop() = `docker rm -f`, which frees VRAM; staged
 weights stay on disk for warm reruns.
@@ -11,12 +11,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..config import JobConfig
-from ..models import build_launch_args, is_s3, local_stage_dir
+from ..models import build_launch_args, is_b2, local_stage_dir
 from ..util import log, run
 from .base import ServerBackend
 
 CONTAINER_MODEL_DIR = "/model"  # where the weights dir is mounted inside the container
-LOCAL_MODELS_ROOT = "~/.cuaeval/models"  # where s3:// checkpoints are staged on this host
+LOCAL_MODELS_ROOT = "~/.cuaeval/models"  # where b2:// checkpoints are staged on this host
 
 
 class LocalDockerServer(ServerBackend):
@@ -29,8 +29,8 @@ class LocalDockerServer(ServerBackend):
         return f"http://localhost:{self.serve.port}/v1"
 
     def _stage_weights(self) -> str:
-        """Return the host path to mount. Download from S3 if needed."""
-        if not is_s3(self.job.weights):
+        """Return the host path to mount. Download from Backblaze B2 if needed."""
+        if not is_b2(self.job.weights):
             path = str(Path(self.job.weights).expanduser())
             log.info("using local weights at %s", path)
             return path
@@ -41,7 +41,7 @@ class LocalDockerServer(ServerBackend):
         if self.dry_run:
             log.info("[dry-run] would download %s to %s", self.job.weights, dest)
             return dest
-        from ..s3 import download_model
+        from ..b2 import download_model
         download_model(self.job.weights, dest)
         return dest
 

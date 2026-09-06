@@ -1,20 +1,46 @@
-# EC2 + AWS-provider + vast.ai-served plan.
+# EC2 + AWS-provider plan, served on a vast.ai box YOU already rented.
 #
 # The intended flow, from a fresh Ubuntu EC2 host:
 #
 #   git clone <this repo> && cd CUAEval
 #   ./setup_ec2.sh plans/ec2_aws_holo3.yaml       # installs deps, bootstraps OSWorld
-#   export AWS_ACCESS_KEY_ID=...  AWS_SECRET_ACCESS_KEY=...
+#   export AWS_ACCESS_KEY_ID=...  AWS_SECRET_ACCESS_KEY=...   # task VMs only
 #   export AWS_SECURITY_GROUP_ID=sg-...  AWS_SUBNET_ID=subnet-...
-#   export VAST_API_KEY=...                         # or: vastai set api-key <key>
+#   export B2_ACCESS_KEY_ID=...  B2_SECRET_ACCESS_KEY=...     # results mirror only
+#   export B2_S3_ENDPOINT=https://s3.us-west-004.backblazeb2.com
 #   uv run cuaeval run plans/ec2_aws_holo3.yaml
 #
 # OSWorld runs its task VMs via the `aws` provider (host/client: this EC2 box
-# spawns worker EC2 client instances). The MODEL is served on a vast.ai GPU box
-# that CUAEval rents, serves, tunnels to localhost, and destroys per job.
+# spawns worker EC2 client instances) — that is the ONLY thing AWS is used for.
+#
+# The MODEL is served on a long-lived vast.ai GPU box that CUAEval does NOT rent
+# or destroy: it reaches the box over `serve.ssh_host`, loads the weights already
+# staged on its disk, tunnels the endpoint to localhost, and on teardown only
+# kills the tmux session (unloading the model, freeing VRAM). The box keeps
+# running between jobs and after the run — you rent and release it yourself.
+#
+# That means the box must already have, before `cuaeval run`:
+#   * vllm importable by its python (no docker is used on the vast side — the
+#     instance's own base image provides the server);
+#   * each job's `weights` directory present at exactly that path;
+#   * an SSH alias here that reaches it (see `ssh_host` below).
+#
+# Nothing else about the box is CUAEval's business, so no VAST_API_KEY is needed
+# for the run itself — only for the `vastai` CLI when you look up its SSH port.
 
 # Where the OSWorld checkout lives (created by `cuaeval bootstrap` / setup_ec2.sh).
 osworld_repo: ./OSWorld
+
+# Mirror results to Backblaze B2 while the run is in progress. Without this they
+# exist only on this host's EBS volume, and terminating/losing the box loses the
+# campaign. Set B2_ACCESS_KEY_ID / B2_SECRET_ACCESS_KEY (and B2_S3_ENDPOINT if not
+# given here) in the environment — see README "Saving results". These are the only
+# B2 credentials this plan needs: its weights are pre-staged, not downloaded.
+results_sync:
+  b2_uri: b2://your-bucket/results
+  endpoint_url:  s3.us-east-005.backblazeb2.com    # your Backblaze S3 endpoint
+  interval: 600            # sync every 10 min during a job, plus once at job end
+  include_videos: true     # keep everything; `--no-videos` (or false) skips recording.mp4
 
 osworld:
   repo_url: https://github.com/xlang-ai/OSWorld
@@ -39,22 +65,33 @@ defaults:
     - osworld-public-evaluation                     # AWS client VM default password
   serve:
     location: remote
-    framework: sglang
-    port: 60000
-    tunnel_port: 9091
-    tp: 1
+    framework: vllm             # must already be installed on the instance
+    # ---- CHANGE ME: your ~/.ssh/config alias for the rented box. It must carry
+    # HostName + Port, since CUAEval calls bare `ssh <alias>` with no -p:
+    #     vastai ssh-url <instance_id>   ->   ssh://root@ssh5.vast.ai:41234
+    ssh_host: vastai
+    port: 60000                 # port the server listens on, on the instance
+    tunnel_port: 9091           # local port CUAEval forwards it to
+    tp: 1                       # tensor-parallel = GPUs to use on the box
     context_length: 32768
-    remote_models_dir: /models
+    remote_models_dir: /models  # only used to stage b2:// weights; inert for
+                                # absolute paths like the ones below
     vast:
-      provision: true          # rent a fresh GPU box for each job...
-      # destroy: (defaults to provision's value) -> box is torn down after the job
-      gpu_name: RTX_4090
-      num_gpus: 1
-      disk: 80
+      # CUAEval neither rents nor destroys the box: it just serves on it.
+      provision: false
+      destroy: false
+      # The fields below are read ONLY when provision: true — kept here so you can
+      # flip back to a rent-per-job box without looking them up again.
+      # gpu_name: RTX_PRO_6000_WS
+      # num_gpus: 1
+      # disk: 512
 
+# `weights` are paths ON THE VAST BOX (not on this EC2 host). deploy.sh checks
+# each one exists before launching and fails loudly if it does not.
 jobs:
-  - label: holo3-gimp-pruned-half
-    weights: s3://omnibrowse-s3/models/holo3-gimp-pruned-half
+  - label: holo-3-1_baseline
+    weights: /models/Holo-3.1-35B-A3B
 
-  - label: holo3-gimp-pruned-quarter
-    weights: s3://omnibrowse-s3/models/holo3-gimp-pruned-quarter
+  - label: holo-3-1_gimp_uniform_ret-90
+    weights: /models/Holo-3.1-gimp-uniform-ret090
+    domains: [gimp]

@@ -1,47 +1,54 @@
-"""OSWorld agent for a self-hosted Holo3 (e.g. the GIMP-pruned Holo3-35B-A3B).
+"""OSWorld agent for a self-hosted Holo3 (e.g. the pruned Holo3.1-35B-A3B).
 
 Drives a stock OpenAI-compatible endpoint (SGLang / vLLM) that serves Holo3, in
-the model's native two-pass loop -- unlike mm_agents/surferH, which delegates the
-whole task to H Company's hosted Agent Platform. Points at OPENAI_BASE_URL, so it
-plugs into the same tunnel-to-vast flow run_osworld_here.sh already uses.
+the model's native *agent loop* -- one generation per step -- so the served
+(pruned or unpruned) model sees exactly the inputs it saw in CUAPruning, the
+harness we used to profile and prune it. Points at OPENAI_BASE_URL, so it plugs
+into the same tunnel-to-vast flow run_osworld_here.sh already uses.
 
-Per step (mirrors H's hai-cookbook navigation_step.py):
-  1. navigation call  -> {note, thought, action}. The action names a UI element
-     by description and carries rough coordinates.
-  2. localization call -> {action: click, x, y} for coordinate actions
-     (click/drag). The localizer's coords are authoritative; nav coords are the
-     fallback if it fails.
+Per step (mirrors CUAPruning's ``holo3`` agent model, agent-loop stage):
+  1. One navigation-and-grounding call over the whole conversation so far ->
+     {note, thought, tool_call}. The tool_call carries the decision AND its
+     coordinates together: ``click``/``drag`` name a UI element by description
+     and carry Holo [0, 1000] coords inline. There is NO second localization
+     pass -- Holo grounds inline in the loop (see holo3_format.py).
 
-The prompts/schemas come from holo3_format.py -- a byte-for-byte copy of the
-module used to build the EASY-EP calibration set -- so the served (pruned) model
-sees exactly the distribution it was calibrated/pruned for.
+The prompts/schema/history mechanic come from holo3_format.py -- a port of
+CUAPruning/calibration/models/holo3.py -- so:
+  * the system prompt embeds the task and the {note, thought, tool_call} schema
+    under <output_format>, and decoding is UNCONSTRAINED (CUAPruning profiled
+    with plain generate; the schema in the prompt is the one that matters);
+  * thinking is ON (the loop plans before each step); the <think> trace is
+    stripped before the JSON is read and never re-enters the conversation;
+  * history is a real multi-turn replay -- past <observation>s, the assistant
+    JSON that answered each, and a <tool_output> turn -- with only the last
+    ``image_budget`` screenshots kept as images and older ones evicted to text.
 
-Coordinates: Holo3 emits model-space coords (H's hub convention is [0, 1000]);
-we rescale to OSWorld screen pixels via the live screenshot size. The divisor is
-the one thing to sanity-check with a grounding smoke test -- override with
-HOLO_COORD_DIVISOR if clicks land off (e.g. set it to 1 if the model turns out to
-emit already-normalized [0,1] coords).
+Coordinates: Holo emits model-space coords ([0, 1000]); we rescale to OSWorld
+screen pixels via the live screenshot size. Override the divisor with
+HOLO_COORD_DIVISOR if a grounding smoke test shows clicks landing off (e.g. set
+it to 1 if the model turns out to emit already-normalized [0, 1] coords).
 
 Contract matches mm_agents/omnibrowse_agent.py: reset(...) then
 predict(instruction, obs) -> (response_str, [pyautogui_code | "WAIT"|"DONE"|"FAIL"]).
 """
 import base64
-import json
 import logging
 import os
-import re
 import time
 from io import BytesIO
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import openai
 from PIL import Image
 
 from mm_agents.holo3_format import (
-    ClickAction,
-    NavigationStep,
-    build_localization_messages,
-    build_navigation_messages,
+    HISTORY_LENGTH,
+    IMAGE_BUDGET,
+    LOOP_MAX_TOKENS,
+    build_agent_loop_conversation,
+    parse_json,
+    replayed_answer,
 )
 
 logger = logging.getLogger("desktopenv.holo3_agent")
@@ -50,15 +57,18 @@ MAX_RETRY_TIMES = 3
 
 
 def json_schema_response_format(model_cls, name: str) -> dict:
-    """OpenAI/SGLang guided-decoding format that forces the model to emit this schema.
+    """OpenAI/SGLang guided-decoding format that forces the model to emit a schema.
 
-    Without this the served Holo3 reasons in prose instead of returning the
-    structured {note,thought,action} / {action,x,y} JSON, so the parse fails.
+    NOT used by the agent loop -- CUAPruning profiled the model with unconstrained
+    decoding, so the served agent must too, or it benchmarks a distribution the
+    model was never pruned under. Kept only for the grounding smoke test, which
+    may want to force a clean Click(x, y) out of a bare endpoint.
     """
     return {
         "type": "json_schema",
         "json_schema": {"name": name, "schema": model_cls.model_json_schema(), "strict": True},
     }
+
 
 # Holo click_type -> pyautogui pointer function.
 _CLICK_FN = {
@@ -72,7 +82,7 @@ class Holo3Agent:
         self,
         platform: str = "ubuntu",
         model: str = "holo3-gimp-pruned",
-        max_tokens: int = 1024,
+        max_tokens: int = LOOP_MAX_TOKENS,
         top_p: float = 0.95,
         temperature: float = 0.0,
         action_space: str = "pyautogui",
@@ -80,7 +90,9 @@ class Holo3Agent:
         coord_divisor: Optional[float] = None,
         scroll_clicks: int = 3,
         invert_scroll: bool = False,
-        history_length: int = 6,
+        history_length: int = HISTORY_LENGTH,
+        image_budget: int = IMAGE_BUDGET,
+        enable_thinking: bool = True,
         max_parse_retries: int = 3,
         retry_temperature: float = 0.0,
     ):
@@ -100,6 +112,12 @@ class Holo3Agent:
         # pyautogui.scroll is "positive = up"; flip if a trial scrolls the wrong way.
         self.invert_scroll = invert_scroll
         self.history_length = history_length
+        # How many screenshots survive as images; older <observation>s keep their
+        # wrapper but their pixels become a text placeholder. Matches CUAPruning.
+        self.image_budget = image_budget
+        # The agent loop plans before acting; the <think> trace is stripped before
+        # parsing. Enabled on the server via chat_template_kwargs.
+        self.enable_thinking = enable_thinking
         self.max_parse_retries = max(1, max_parse_retries)
         self.retry_temperature = retry_temperature
 
@@ -109,143 +127,151 @@ class Holo3Agent:
         self._reset_memory()
 
     def _reset_memory(self) -> None:
-        self.screenshots: List[str] = []       # base64 PNG per step
-        self.notes: List[str] = []             # model note per step
-        self.thoughts: List[str] = []          # model thought per step
-        self.action_log: List[str] = []        # short human-readable action per step
-        self.responses: List[str] = []         # raw nav+loc JSON per step
+        # One entry per completed step, oldest first. Each carries the screenshot
+        # the model saw (base64 PNG), the assistant JSON it emitted (parsed and
+        # re-dumped, thinking stripped), and the tool it called. This is exactly
+        # what build_agent_loop_conversation replays into the next prompt.
+        self.history: List[dict] = []
+        self.responses: List[str] = []         # raw generation per step, for the traj log
 
     # ------------------------------------------------------------------ predict
     def predict(self, instruction: str, obs: Dict) -> Tuple[str, List[str]]:
         png = obs["screenshot"]
         width, height = Image.open(BytesIO(png)).size
         b64 = base64.b64encode(png).decode("utf-8")
-        self.screenshots.append(b64)
 
-        nav = self._navigate(instruction, b64)
-        if not nav or not isinstance(nav.get("action"), dict):
-            logger.error("Holo3 navigation produced no usable action.")
-            self.notes.append(""); self.thoughts.append("")
-            self.action_log.append(""); self.responses.append(json.dumps(nav or {}))
-            return json.dumps(nav or {}), []
+        # Rebuild the multi-turn conversation the served agent would be holding:
+        # system(task) + replayed past steps + the current <observation>.
+        messages = build_agent_loop_conversation(
+            task=instruction,
+            current_image=b64,
+            history=self.history,
+            history_length=self.history_length,
+            image_budget=self.image_budget,
+        )
+        messages = self._inline_images(messages)
 
-        self.notes.append(str(nav.get("note", "")))
-        self.thoughts.append(str(nav.get("thought", "")))
+        raw, step = self._generate_step(messages)
+        self.responses.append(raw)
 
-        pyautogui_code, log, loc = self._translate(nav["action"], b64, width, height)
-        self.action_log.append(log)
-        self.responses.append(json.dumps({"navigation": nav, "localization": loc}))
+        if step is None or not isinstance(step.get("tool_call"), dict):
+            logger.error("Holo3 agent loop produced no usable tool_call.")
+            # Nothing to replay for a failed step: leave history untouched so the
+            # next prompt does not claim a turn that never resolved.
+            return raw, []
+
+        pyautogui_code, log = self._translate(step["tool_call"], width, height)
+
+        # Record the step for replay -- the parsed, re-dumped answer, never the
+        # raw generation or its <think> trace.
+        answer, tool_name = replayed_answer(raw)
+        self.history.append({"image": b64, "answer": answer, "tool_name": tool_name})
+
         logger.info("Holo3 step: %s -> %s", log, pyautogui_code)
-        return self.responses[-1], pyautogui_code
+        return raw, pyautogui_code
 
-    # --------------------------------------------------------------- two passes
-    def _navigate(self, instruction: str, b64: str) -> Optional[dict]:
-        messages = build_navigation_messages(
-            task=instruction, image_path="__CURRENT__", step=len(self.screenshots))
-        messages = self._inline_image(messages, b64)
-        self._inject_history(messages)
-        resp = self.call_llm(messages, self.max_tokens,
-                             json_schema_response_format(NavigationStep, "navigation_step"))
-        return self._parse_json(resp)
-
-    def _localize(self, element: str, b64: str) -> Optional[Tuple[float, float]]:
-        messages = build_localization_messages(instruction=element, image_path="__CURRENT__")
-        messages = self._inline_image(messages, b64)
-        obj = self._parse_json(self.call_llm(
-            messages, 256, json_schema_response_format(ClickAction, "click")))
-        if obj and "x" in obj and "y" in obj:
-            try:
-                return float(obj["x"]), float(obj["y"])
-            except (TypeError, ValueError):
-                return None
-        return None
+    def _generate_step(self, messages: List[dict]) -> Tuple[str, Optional[dict]]:
+        """Call the loop, parse; re-sample on a parse miss up to max_parse_retries."""
+        raw = ""
+        for attempt in range(self.max_parse_retries):
+            temperature = self.temperature if attempt == 0 else self.retry_temperature
+            # A zero retry temperature would resample identically, so stop early.
+            if attempt > 0 and self.retry_temperature <= 0.0:
+                break
+            raw = self.call_llm(messages, self.max_tokens, temperature=temperature)
+            step = parse_json(raw)
+            if isinstance(step, dict) and isinstance(step.get("tool_call"), dict):
+                return raw, step
+            logger.warning("Holo3 parse miss (attempt %d/%d).", attempt + 1,
+                           self.max_parse_retries)
+        return raw, parse_json(raw)
 
     # ---------------------------------------------------------------- translate
-    def _translate(self, action: dict, b64: str, width: int,
-                   height: int) -> Tuple[List[str], str, Optional[dict]]:
-        """Holo action dict -> (pyautogui code list, log string, localization dict)."""
-        kind = action.get("action")
-        loc: Optional[dict] = None
+    def _translate(self, call: dict, width: int, height: int) -> Tuple[List[str], str]:
+        """Holo tool_call dict -> (pyautogui code list, log string).
+
+        Coordinates arrive inline in Holo's model space.
+        """
+        name = call.get("tool_name")
 
         def to_px(xm, ym) -> Tuple[int, int]:
             x = round(float(xm) / self.coord_divisor * width)
             y = round(float(ym) / self.coord_divisor * height)
             return max(0, min(width - 1, x)), max(0, min(height - 1, y))
 
-        def grounded_xy(element: str) -> Optional[Tuple[int, int]]:
-            nonlocal loc
-            g = self._localize(element, b64)                # localizer is authoritative
-            if g is None:
-                if "x" in action and "y" in action:         # fall back to nav coords
-                    return to_px(action["x"], action["y"])
-                return None
-            loc = {"x": g[0], "y": g[1]}
-            return to_px(g[0], g[1])
+        if name == "click":
+            if "x" not in call or "y" not in call:
+                return [], "click (no coordinates)"
+            xy = to_px(call["x"], call["y"])
+            fn = _CLICK_FN.get(call.get("click_type", "left"), "click")
+            return [f"pyautogui.{fn}({xy[0]}, {xy[1]})"], f"{fn} @ {xy}"
 
-        if kind == "click_element":
-            xy = grounded_xy(action.get("element", ""))
-            if xy is None:
-                return [], "click_element (localization failed)", loc
-            fn = _CLICK_FN.get(action.get("click_type", "left"), "click")
-            return [f"pyautogui.{fn}({xy[0]}, {xy[1]})"], f"{fn} @ {xy}", loc
-
-        if kind == "drag":
-            xy = grounded_xy(action.get("element", ""))
-            if xy is None:
-                return [], "drag (localization failed)", loc
-            button = action.get("button", "left")
+        if name == "drag":
+            if "x" not in call or "y" not in call:
+                return [], "drag (no coordinates)"
+            xy = to_px(call["x"], call["y"])
+            button = call.get("button", "left")
             return [f"pyautogui.dragTo({xy[0]}, {xy[1]}, button={button!r}, duration=0.5)"], \
-                f"drag @ {xy}", loc
+                f"drag @ {xy}"
 
-        if kind == "write":
-            content = action.get("content", "")
-            return [f"pyautogui.write({content!r}, interval=0.02)"], f"write {content!r}", loc
+        if name == "write":
+            content = call.get("content", "")
+            code = [f"pyautogui.write({content!r}, interval=0.02)"]
+            if call.get("press_enter"):
+                code.append("pyautogui.press('enter')")
+            return code, f"write {content!r}" + (" +enter" if call.get("press_enter") else "")
 
-        if kind == "key":
-            keys = action.get("keys", [])
+        if name == "press_keys":
+            keys = call.get("keys", [])
             keys = [keys] if isinstance(keys, str) else list(keys)
-            if action.get("hold"):
+            if call.get("hold"):
                 inner = ", ".join(repr(k) for k in keys)
-                return [f"pyautogui.hotkey({inner})"], f"hotkey {keys}", loc
+                return [f"pyautogui.hotkey({inner})"], f"hotkey {keys}"
             if len(keys) == 1:
-                presses = int(action.get("presses", 1) or 1)
+                presses = int(call.get("presses", 1) or 1)
                 code = f"pyautogui.press({keys[0]!r}" + (f", presses={presses})" if presses > 1 else ")")
-                return [code], f"press {keys[0]} x{presses}", loc
-            return [f"pyautogui.press({keys!r})"], f"press {keys}", loc
+                return [code], f"press {keys[0]} x{presses}"
+            return [f"pyautogui.press({keys!r})"], f"press {keys}"
 
-        if kind == "scroll":
-            direction = action.get("direction", "down")
+        if name == "scroll":
+            direction = call.get("direction", "down")
             mag = self.scroll_clicks
             if direction in ("up", "down"):
                 amt = mag if direction == "up" else -mag
                 if self.invert_scroll:
                     amt = -amt
-                return [f"pyautogui.scroll({amt})"], f"scroll {direction}", loc
+                return [f"pyautogui.scroll({amt})"], f"scroll {direction}"
             amt = mag if direction == "right" else -mag
-            return [f"pyautogui.hscroll({amt})"], f"hscroll {direction}", loc
+            return [f"pyautogui.hscroll({amt})"], f"hscroll {direction}"
 
-        if kind == "wait":
-            return ["WAIT"], "wait", loc
+        if name == "wait":
+            return ["WAIT"], "wait"
 
-        if kind == "answer":
-            status = action.get("status", "success")
-            return (["DONE"] if status == "success" else ["FAIL"]), f"answer {status}", loc
+        if name == "answer":
+            status = call.get("status", "success")
+            return (["DONE"] if status == "success" else ["FAIL"]), f"answer {status}"
 
-        logger.error("Unknown Holo3 action: %r", action)
-        return [], f"unknown {kind}", loc
+        logger.error("Unknown Holo3 tool_call: %r", call)
+        return [], f"unknown {name}"
 
     # ------------------------------------------------------------------ helpers
     @staticmethod
-    def _inline_image(messages: List[dict], b64: str) -> List[dict]:
-        """Swap holo3_format's path-based image items for OpenAI data-URL parts."""
-        data_url = f"data:image/png;base64,{b64}"
+    def _inline_images(messages: List[dict]) -> List[dict]:
+        """Swap holo3_format's carrier image items for OpenAI data-URL parts.
+
+        Each image part carries its own base64 PNG (set by _image_item), so a
+        multi-image history inlines the right screenshot per <observation> --
+        evicted ones were already turned into text by the trim step.
+        """
         out = []
         for m in messages:
             content = m["content"]
             if isinstance(content, list):
                 new = []
                 for item in content:
-                    if isinstance(item, dict) and (item.get("type") == "image" or "image" in item):
+                    if isinstance(item, dict) and item.get("type") == "image":
+                        b64 = item.get("image", "")
+                        data_url = f"data:image/png;base64,{b64}"
                         new.append({"type": "image_url", "image_url": {"url": data_url}})
                     else:
                         new.append(item)
@@ -254,50 +280,25 @@ class Holo3Agent:
                 out.append(m)
         return out
 
-    def _inject_history(self, messages: List[dict]) -> None:
-        """Prepend a compact previous-actions log to the navigation user turn.
-
-        Holo's navigation loop conditions on a running action memory; we keep the
-        current screenshot as the only image and summarize prior steps as text.
-        """
-        if not self.action_log or self.history_length <= 0:
-            return
-        recent = self.action_log[-self.history_length:]
-        past_notes = [n for n in self.notes[-self.history_length:] if n]
-        log_text = "<previous_actions>\n" + "\n".join(
-            f"{i + 1}. {a}" for i, a in enumerate(recent)) + "\n</previous_actions>\n"
-        if past_notes:
-            log_text += "<notes>\n" + "\n".join(past_notes) + "\n</notes>\n"
-        for m in messages:
-            if m["role"] == "user" and isinstance(m["content"], list):
-                m["content"].insert(0, {"type": "text", "text": log_text})
-                break
-
+    # Kept for the grounding smoke test, which builds a one-off localization call.
     @staticmethod
     def _parse_json(text: str) -> Optional[dict]:
-        """Lenient JSON extraction: whole string, fenced block, or first {...}."""
-        if not text or not text.strip():
-            return None
-        for candidate in (text, *re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)):
-            try:
-                return json.loads(candidate.strip())
-            except Exception:  # noqa: BLE001
-                continue
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except Exception:  # noqa: BLE001
-                return None
-        return None
+        return parse_json(text)
 
     def call_llm(self, messages: List[dict], max_tokens: int,
+                 temperature: Optional[float] = None,
                  response_format: Optional[dict] = None) -> str:
         base_url = os.environ.get("OPENAI_BASE_URL", "http://localhost:8000/v1")
         api_key = os.environ.get("OPENAI_API_KEY", "EMPTY")
         client = openai.OpenAI(base_url=base_url, api_key=api_key)
-        kwargs = dict(model=self.model, messages=messages, max_tokens=max_tokens,
-                      temperature=self.temperature, top_p=self.top_p)
+        kwargs: Dict[str, Any] = dict(
+            model=self.model, messages=messages, max_tokens=max_tokens,
+            temperature=self.temperature if temperature is None else temperature,
+            top_p=self.top_p)
+        # Thinking is a chat-template option, forwarded to SGLang/vLLM via
+        # extra_body -- the same knob CUAPruning set as chat_template_kwargs.
+        if self.enable_thinking:
+            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": True}}
         if response_format is not None:
             kwargs["response_format"] = response_format
         for attempt in range(1, MAX_RETRY_TIMES + 1):
