@@ -1,0 +1,46 @@
+# Qwen adapter set for OSWorld.
+#
+# `cuaeval bootstrap` copies each file below on top of a pristine upstream OSWorld
+# clone. `src` is relative to THIS directory; `dest` is relative to the OSWorld
+# repo root (authoritative).
+#
+# Upstream OSWorld ships its own mm_agents/qwen/ and run_multienv_qwen.py at these
+# same paths, so a plain bootstrap would keep upstream's copies. Every entry is
+# marked `overwrite: true` so ours always win (the runner needs our --domains).
+
+name: qwen
+description: >-
+  Qwen computer-use harness — an OpenAI-compatible QwenAgent (mm_agents.qwen)
+  plus its OSWorld multi-env runner. Talks to any endpoint via OPENAI_BASE_URL.
+
+# Plans that set `runner: qwen` resolve to scripts/python/run_multienv_qwen.py.
+runner: qwen
+
+files:
+  - src: mm_agents/qwen/__init__.py
+    dest: mm_agents/qwen/__init__.py
+    overwrite: true
+  - src: mm_agents/qwen/actions.py
+    dest: mm_agents/qwen/actions.py
+    overwrite: true
+  - src: mm_agents/qwen/client.py
+    dest: mm_agents/qwen/client.py
+    overwrite: true
+  - src: mm_agents/qwen/history.py
+    dest: mm_agents/qwen/history.py
+    overwrite: true
+  - src: mm_agents/qwen/images.py
+    dest: mm_agents/qwen/images.py
+    overwrite: true
+  - src: mm_agents/qwen/main.py
+    dest: mm_agents/qwen/main.py
+    overwrite: true
+  - src: mm_agents/qwen/parser.py
+    dest: mm_agents/qwen/parser.py
+    overwrite: true
+  - src: mm_agents/qwen/prompts.py
+    dest: mm_agents/qwen/prompts.py
+    overwrite: true
+  - src: scripts/python/run_multienv_qwen.py
+    dest: scripts/python/run_multienv_qwen.py
+    overwrite: true

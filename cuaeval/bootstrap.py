@@ -38,6 +38,8 @@ class AdapterManifest:
     name: str
     runner: str | None
     files: list[tuple[str, str]]   # (src-relative-to-adapter-dir, dest-relative-to-repo)
+    # dests that replace an upstream file of the same path even without --force
+    overwrite: set[str]
     root: Path
 
     @classmethod
@@ -53,10 +55,11 @@ class AdapterManifest:
             )
         data = yaml.safe_load(mpath.read_text()) or {}
         files = [(f["src"], f["dest"]) for f in (data.get("files") or [])]
+        overwrite = {f["dest"] for f in (data.get("files") or []) if f.get("overwrite")}
         if not files:
             raise ValueError(f"adapter {name!r}: manifest lists no files")
         return cls(name=data.get("name", name), runner=data.get("runner"),
-                   files=files, root=adir)
+                   files=files, overwrite=overwrite, root=adir)
 
 
 def bootstrap(plan: Plan, *, dry_run: bool = False, force: bool = False) -> None:
@@ -145,7 +148,7 @@ def _apply_adapter(m: AdapterManifest, repo: Path, *, dry_run: bool, force: bool
         dest = repo / dest_rel
         if not dry_run and not src.exists():
             raise FileNotFoundError(f"adapter {m.name!r}: source file missing: {src}")
-        if dest.exists() and not force:
+        if dest.exists() and not force and dest_rel not in m.overwrite:
             log.warning("  skip (exists, use --force to overwrite): %s", dest_rel)
             continue
         log.info("  copy %s -> %s", src_rel, dest_rel)

@@ -1,0 +1,130 @@
+# EC2 + AWS-provider plan for the Qwen3.6-35B-A3B base model, driven by the
+# QwenAgent harness (adapters/qwen). Mirrors ec2_aws_holo3_baseline.yaml apart from
+# the runner/agent knobs, context length, weights, labels and B2 prefix.
+#
+# Served on a vast.ai box YOU already rented.
+#
+# The intended flow, from a fresh Ubuntu EC2 host:
+#
+#   git clone <this repo> && cd CUAEval
+#   ./setup_ec2.sh plans/ec2_aws_qwen_baseline.yaml       # installs deps, bootstraps OSWorld
+#   export AWS_ACCESS_KEY_ID=...  AWS_SECRET_ACCESS_KEY=...   # task VMs only
+#   export AWS_SECURITY_GROUP_ID=sg-...  AWS_SUBNET_ID=subnet-...
+#   export B2_ACCESS_KEY_ID=...  B2_SECRET_ACCESS_KEY=...     # results mirror only
+#   export B2_S3_ENDPOINT=https://s3.us-west-004.backblazeb2.com
+#   uv run cuaeval run plans/ec2_aws_qwen_baseline.yaml
+#
+# OSWorld runs its task VMs via the `aws` provider (host/client: this EC2 box
+# spawns worker EC2 client instances) — that is the ONLY thing AWS is used for.
+#
+# The MODEL is served on a long-lived vast.ai GPU box that CUAEval does NOT rent
+# or destroy: it reaches the box over `serve.ssh_host`, loads the weights already
+# staged on its disk, tunnels the endpoint to localhost, and on teardown only
+# kills the tmux session (unloading the model, freeing VRAM). The box keeps
+# running between jobs and after the run — you rent and release it yourself.
+#
+# That means the box must already have, before `cuaeval run`:
+#   * vllm importable by its python (no docker is used on the vast side — the
+#     instance's own base image provides the server);
+#   * each job's `weights` directory present at exactly that path;
+#   * an SSH alias here that reaches it (see `ssh_host` below).
+#
+# Nothing else about the box is CUAEval's business, so no VAST_API_KEY is needed
+# for the run itself — only for the `vastai` CLI when you look up its SSH port.
+
+# Where the OSWorld checkout lives (created by `cuaeval bootstrap` / setup_ec2.sh).
+osworld_repo: ./OSWorld
+
+# Mirror results to Backblaze B2 while the run is in progress. Without this they
+# exist only on this host's EBS volume, and terminating/losing the box loses the
+# campaign. Set B2_ACCESS_KEY_ID / B2_SECRET_ACCESS_KEY (and B2_S3_ENDPOINT if not
+# given here) in the environment — see README "Saving results". These are the only
+# B2 credentials this plan needs: its weights are pre-staged, not downloaded.
+results_sync:
+  b2_uri: b2://cuapruning/osworld-qwen-3-6-base
+  endpoint_url: https://s3.us-east-005.backblazeb2.com    # your Backblaze S3 endpoint
+  interval: 600            # sync every 10 min during a job, plus once at job end
+  include_videos: true     # keep everything; `--no-videos` (or false) skips recording.mp4
+
+osworld:
+  repo_url: https://github.com/xlang-ai/OSWorld
+  ref: main                 # pin a commit SHA or tag here for reproducible runs
+  adapters: [qwen]          # copied from CUAEval/adapters/qwen on top of the clone
+  python: /usr/bin/python3 
+
+defaults:
+  runner: qwen                                      # -> run_multienv_qwen.py (QwenAgent)
+  meta: evaluation_examples/test_nogdrive.json
+  result_dir: ./results
+  max_steps: 15
+  num_envs: 5
+  provider_name: aws                                # OSWorld task VMs on AWS
+  region: us-east-1
+  runner_args:
+    - --headless
+    - --observation_type
+    - screenshot
+    - --sleep_after_execution
+    - "3"
+    - --client_password
+    - osworld-public-evaluation                     # AWS client VM default password
+    # QwenAgent knobs (run_multienv_qwen.py). Thinking ON to match the Holo3
+    # baseline (which runs with enable_thinking); max_tokens 4096 matches Holo3's
+    # generation cap. --coord stays at its default (relative, 0-999 grid).
+    - --enable_thinking
+    - --max_tokens
+    - "4096"
+  serve:
+    location: remote
+    framework: vllm             # must already be installed on the instance
+    # ---- CHANGE ME: your ~/.ssh/config alias for the rented box. It must carry
+    # HostName + Port, since CUAEval calls bare `ssh <alias>` with no -p:
+    #     vastai ssh-url <instance_id>   ->   ssh://root@ssh5.vast.ai:41234
+    ssh_host: vastai
+    port: 60000                 # port the server listens on, on the instance
+    tunnel_port: 9091           # local port CUAEval forwards it to
+    tp: 1                       # tensor-parallel = GPUs to use on the box
+    # QwenAgent replays every step's screenshot (~2k tokens each at 1920x1080,
+    # up to 20 before folding) plus its responses, far more than Holo3's 3-image
+    # budget. Worst case at max_steps 15 is ~95k tokens, so 32k would overflow.
+    context_length: 131072
+    extra_args:
+      # This checkpoint is a hybrid attention/linear-attention model: every concurrent decode
+      # sequence needs its own recurrent-state cache block, and only ~728 fit at
+      # gpu_memory_utilization 0.9. vLLM's default max_num_seqs of 1024 exceeds
+      # that and aborts CUDA graph capture. Our real concurrency is num_envs.
+      - --max-num-seqs
+      - "64"
+      # Split <think> into reasoning_content; the agent re-merges it as a proper
+      # <think>...</think> block (without this the opening tag is missing).
+      - --reasoning-parser
+      - qwen3
+    remote_models_dir: /models  # only used to stage b2:// weights; inert for
+                                # absolute paths like the ones below
+    env:
+      # This image ships the CUDA runtime but no toolkit (no nvcc), so FlashInfer
+      # cannot JIT its sampling kernel. Use vLLM's native top-k/top-p sampler.
+      VLLM_USE_FLASHINFER_SAMPLER: "0"
+    vast:
+      # CUAEval neither rents nor destroys the box: it just serves on it.
+      provision: false
+      destroy: false
+      # The fields below are read ONLY when provision: true — kept here so you can
+      # flip back to a rent-per-job box without looking them up again.
+      # gpu_name: RTX_PRO_6000_WS
+      # num_gpus: 1
+      # disk: 512
+
+# ---- CHANGE ME if your Qwen weights live elsewhere on the box.
+# `weights` are paths ON THE VAST BOX (not on this EC2 host). deploy.sh checks
+# each one exists before launching and fails loudly if it does not.
+jobs:
+  - label: qwen-3-6_baseline-0
+    weights: /models/Qwen3.6-35B-A3B
+
+  - label: qwen-3-6_baseline-1
+    weights: /models/Qwen3.6-35B-A3B
+
+  - label: qwen-3-6_baseline-2
+    weights: /models/Qwen3.6-35B-A3B
+
