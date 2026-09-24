@@ -43,6 +43,10 @@ class ServerBackend(abc.ABC):
     def endpoint(self) -> str:
         """Local OpenAI base URL, e.g. http://localhost:60000/v1."""
 
+    def runner_env(self) -> dict[str, str]:
+        """Extra env vars for the OSWorld runner (override OPENAI_API_KEY etc.)."""
+        return {}
+
     # --- readiness -----------------------------------------------------------
     def wait_ready(self) -> None:
         if self.dry_run:

@@ -64,6 +64,9 @@ def call_openai_compatible(
 ) -> str:
     resolved_base_url = base_url or os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1")
     resolved_api_key = api_key or os.environ.get("OPENAI_API_KEY", "dummy")
+    # CUAEVAL_API_MODEL decouples the API model id (e.g. an OpenRouter id) from
+    # the runner's --model, which also names the results dir.
+    model = os.environ.get("CUAEVAL_API_MODEL") or model
     default_timeout = str(
         float(os.environ.get("OSWORLD_HTTP_CONNECT_TIMEOUT", "10"))
         + float(os.environ.get("OSWORLD_HTTP_READ_TIMEOUT", "120"))

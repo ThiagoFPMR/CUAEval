@@ -12,6 +12,9 @@ CUAEval owns three things OSWorld itself doesn't:
 2. **Serving** — bring each model up behind an OpenAI-compatible endpoint (a
    vast.ai box it can **rent and destroy**, or local Docker), tunnel it to
    `localhost`, run OSWorld against it, then tear it down before the next model.
+   Or skip serving entirely with `serve.location: openrouter` and call a model
+   hosted on [OpenRouter](https://openrouter.ai) (`serve.api_model`, key in
+   `OPENROUTER_API_KEY`) — see `plans/openrouter_qwen.yaml`.
 3. **Orchestration** — a `plan.yaml` lines up several models; results nest per
    model and the OSWorld runner is resumable, so reruns continue where they left off.
 

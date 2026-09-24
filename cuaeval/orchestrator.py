@@ -43,6 +43,16 @@ def _preflight(plan: Plan, *, dry_run: bool = False) -> None:
     if not dry_run:
         _preflight_aws(plan)
         _preflight_b2_weights(plan)
+        _preflight_openrouter(plan)
+
+
+def _preflight_openrouter(plan: Plan) -> None:
+    """OpenRouter jobs need their API key in the environment."""
+    missing = sorted({j.serve.api_key_env for j in plan.jobs
+                      if j.serve.location == "openrouter"
+                      and not os.environ.get(j.serve.api_key_env)})
+    if missing:
+        raise EnvironmentError("openrouter jobs need these env vars set: " + ", ".join(missing))
 
 
 def _preflight_aws(plan: Plan) -> None:
@@ -96,9 +106,13 @@ def run_plan(plan: Plan, *, dry_run: bool = False, only: set[str] | None = None,
 
     for i, job in enumerate(jobs, 1):
         log.info("=" * 72)
-        log.info("[%d/%d] JOB %r  serve=%s/%s  weights=%s",
-                 i, len(jobs), job.label, job.serve.location, job.serve.framework,
-                 job.weights)
+        if job.serve.location == "openrouter":
+            log.info("[%d/%d] JOB %r  serve=openrouter  model=%s",
+                     i, len(jobs), job.label, job.serve.api_model)
+        else:
+            log.info("[%d/%d] JOB %r  serve=%s/%s  weights=%s",
+                     i, len(jobs), job.label, job.serve.location, job.serve.framework,
+                     job.weights)
         syncer = make_syncer(plan, job, dry_run=dry_run)
         try:
             _run_one(plan, job, syncer, dry_run=dry_run)
@@ -130,7 +144,8 @@ def _run_one(plan: Plan, job: JobConfig, syncer, *, dry_run: bool) -> None:
         with make_backend(job, dry_run=dry_run) as backend:
             backend.start()
             backend.wait_ready()
-            run_benchmark(plan, job, backend.endpoint, dry_run=dry_run)
+            run_benchmark(plan, job, backend.endpoint, dry_run=dry_run,
+                          extra_env=backend.runner_env())
         # backend.__exit__ -> stop(): unload the model before the next job.
 
 

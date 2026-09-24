@@ -61,6 +61,7 @@ class VastConfig:
 class ServeConfig:
     # where + how to serve
     location: str = "remote"          # "local" (docker here) | "remote" (vast.ai)
+                                     # | "openrouter" (hosted model, nothing to serve)
     framework: str = "sglang"         # "sglang" | "vllm"
 
     # server params (both frameworks)
@@ -91,6 +92,11 @@ class ServeConfig:
         "B2_ACCESS_KEY_ID", "B2_SECRET_ACCESS_KEY", "B2_S3_ENDPOINT", "B2_REGION",
     ])  # env var names forwarded to the instance for the B2 weight download
 
+    # openrouter only: call a hosted model instead of serving weights
+    api_model: str | None = None      # OpenRouter model id, e.g. "qwen/qwen3-vl-235b-a22b-instruct"
+    api_base_url: str = "https://openrouter.ai/api/v1"
+    api_key_env: str = "OPENROUTER_API_KEY"  # env var holding the key (never put it in the plan)
+
     # timeouts (seconds)
     up_timeout: int = 2400            # includes any B2 download before the server is ready
     down_timeout: int = 180
@@ -106,7 +112,7 @@ class ServeConfig:
 @dataclass
 class JobConfig:
     label: str                        # --model label + result subdir; must be unique
-    weights: str                      # local path, remote path, or b2:// URI
+    weights: str = ""                 # local path, remote path, or b2:// URI (unused for openrouter)
     serve: ServeConfig = field(default_factory=ServeConfig)
 
     # OSWorld runner selection + knobs
@@ -235,7 +241,8 @@ def load_plan(path: str | Path) -> Plan:
         serve_kwargs = _filter_known(ServeConfig, serve_raw)
         serve_kwargs["vast"] = VastConfig(**_filter_known(VastConfig, vast_raw))
         job_kwargs["serve"] = ServeConfig(**serve_kwargs)
-        if "label" not in job_kwargs or "weights" not in job_kwargs:
+        needs_weights = job_kwargs["serve"].location != "openrouter"
+        if "label" not in job_kwargs or (needs_weights and "weights" not in job_kwargs):
             raise ValueError(f"job #{i} is missing required key 'label' and/or 'weights'")
         job = JobConfig(**job_kwargs)
 
@@ -271,8 +278,13 @@ def _validate_job(job: JobConfig) -> None:
         raise ValueError(f"{job.label}: AWS S3 weights are no longer supported — "
                          "copy the checkpoint to Backblaze B2 and use a b2:// URI")
     s = job.serve
-    if s.location not in ("local", "remote"):
-        raise ValueError(f"{job.label}: serve.location must be 'local' or 'remote'")
+    if s.location not in ("local", "remote", "openrouter"):
+        raise ValueError(f"{job.label}: serve.location must be 'local', 'remote' or 'openrouter'")
+    if s.location == "openrouter":
+        if not s.api_model:
+            raise ValueError(f"{job.label}: serve.location=openrouter requires serve.api_model "
+                             "(an OpenRouter model id, e.g. qwen/qwen3-vl-235b-a22b-instruct)")
+        return  # nothing is served, so none of the serving checks below apply
     if s.framework not in ("sglang", "vllm"):
         raise ValueError(f"{job.label}: serve.framework must be 'sglang' or 'vllm'")
     if s.location == "remote" and not s.ssh_host and not s.vast.provision:

@@ -61,6 +61,9 @@ def _cmd_check(args: argparse.Namespace) -> int:
              len(plan.jobs), plan.osworld_repo, plan.osworld_python)
     for job in plan.jobs:
         s = job.serve
+        if s.location == "openrouter":
+            log.info("  - %-24s openrouter  model=%s  (%s)", job.label, s.api_model, s.api_base_url)
+            continue
         where = (f"local docker ({s.resolved_image()})" if s.location == "local"
                  else f"remote {s.ssh_host} (tunnel :{s.resolved_tunnel_port()})")
         if job.domains:

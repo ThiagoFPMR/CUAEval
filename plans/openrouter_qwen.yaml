@@ -1,0 +1,45 @@
+# Benchmark a model hosted on OpenRouter — nothing is served, no GPU box needed.
+# The agent calls https://openrouter.ai/api/v1 directly with serve.api_model.
+#
+#   export OPENROUTER_API_KEY=sk-or-...
+#   export AWS_ACCESS_KEY_ID=...  AWS_SECRET_ACCESS_KEY=...   # task VMs only
+#   export AWS_SECURITY_GROUP_ID=sg-...  AWS_SUBNET_ID=subnet-...
+#   uv run cuaeval check plans/openrouter_qwen.yaml
+#   uv run cuaeval run   plans/openrouter_qwen.yaml
+
+osworld_repo: ./OSWorld
+
+osworld:
+  repo_url: https://github.com/xlang-ai/OSWorld
+  ref: main
+  adapters: [qwen]
+  python: /usr/bin/python3
+
+defaults:
+  runner: qwen                                      # -> run_multienv_qwen.py (QwenAgent)
+  meta: evaluation_examples/test_nogdrive.json
+  result_dir: ./results
+  max_steps: 15
+  num_envs: 5
+  provider_name: aws
+  region: us-east-1
+  runner_args:
+    - --headless
+    - --observation_type
+    - screenshot
+    - --sleep_after_execution
+    - "3"
+    - --client_password
+    - osworld-public-evaluation
+    - --max_tokens
+    - "4096"
+  serve:
+    location: openrouter
+    api_key_env: OPENROUTER_API_KEY   # name of the env var, not the key itself
+    # api_base_url: https://openrouter.ai/api/v1   # default
+
+jobs:
+  # label names the results dir; api_model is the OpenRouter model id.
+  - label: qwen3-vl-235b-openrouter
+    serve:
+      api_model: qwen/qwen3-vl-235b-a22b-instruct

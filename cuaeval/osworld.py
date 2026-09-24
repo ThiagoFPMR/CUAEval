@@ -48,9 +48,11 @@ def build_command(plan: Plan, job: JobConfig) -> list[str]:
     return cmd
 
 
-def run_benchmark(plan: Plan, job: JobConfig, endpoint: str, *, dry_run: bool = False) -> None:
+def run_benchmark(plan: Plan, job: JobConfig, endpoint: str, *, dry_run: bool = False,
+                  extra_env: dict[str, str] | None = None) -> None:
     cmd = build_command(plan, job)
     env = {"OPENAI_BASE_URL": endpoint, "OPENAI_API_KEY": job.api_key}
+    env.update(extra_env or {})
     log.info("running OSWorld: model=%s runner=%s endpoint=%s", job.label, job.runner, endpoint)
     # Stream the runner's output straight through (no capture) so long runs are
     # observable live; cwd is the repo so its relative paths (evaluation_examples,

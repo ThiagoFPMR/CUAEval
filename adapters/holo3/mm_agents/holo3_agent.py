@@ -292,7 +292,10 @@ class Holo3Agent:
         api_key = os.environ.get("OPENAI_API_KEY", "EMPTY")
         client = openai.OpenAI(base_url=base_url, api_key=api_key)
         kwargs: Dict[str, Any] = dict(
-            model=self.model, messages=messages, max_tokens=max_tokens,
+            # CUAEVAL_API_MODEL decouples the API model id (e.g. an OpenRouter id)
+            # from self.model, which also names the results dir.
+            model=os.environ.get("CUAEVAL_API_MODEL") or self.model,
+            messages=messages, max_tokens=max_tokens,
             temperature=self.temperature if temperature is None else temperature,
             top_p=self.top_p)
         # Thinking is a chat-template option, forwarded to SGLang/vLLM via

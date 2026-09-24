@@ -21,6 +21,15 @@ export OPENAI_BASE_URL=http://127.0.0.1:8000/v1
 export OPENAI_API_KEY=dummy
 ```
 
+To call a hosted model (e.g. OpenRouter) whose id differs from `--model` (which
+also names the results dir), set `CUAEVAL_API_MODEL`:
+
+```bash
+export OPENAI_BASE_URL=https://openrouter.ai/api/v1
+export OPENAI_API_KEY="$OPENROUTER_API_KEY"
+export CUAEVAL_API_MODEL=qwen/qwen3-vl-235b-a22b-instruct
+```
+
 Useful runtime knobs:
 
 - `OSWORLD_MAX_RETRY_TIMES`
