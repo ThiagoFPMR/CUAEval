@@ -40,6 +40,6 @@ defaults:
 
 jobs:
   # label names the results dir; api_model is the OpenRouter model id.
-  - label: qwen3-vl-235b-openrouter
+  - label: qwen3.5-397b-openrouter
     serve:
-      api_model: qwen/qwen3-vl-235b-a22b-instruct
+      api_model: qwen/qwen3.5-397b-a17b
